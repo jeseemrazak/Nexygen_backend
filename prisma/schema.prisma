@@ -1,0 +1,975 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// --- ENUMS ---
+enum Role {
+  ADMIN
+  MERCHANDISER
+}
+
+enum SalesOrderStatus {
+  DRAFT // Converted from a Quotation, not yet confirmed — no merchandiser assigned yet
+  CONFIRMED // Merchandiser assigned — ready to be delivered/invoiced, in one shot or partially
+  DONE // Every line fully delivered
+  CANCELLED
+}
+
+enum DeliveryStatus {
+  PENDING // Created, not yet shipped
+  SHIPPED // On the truck
+  DELIVERED // Arrived, proof of delivery captured
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+}
+
+enum StockMovementType {
+  TRANSFER
+  WRITE_OFF
+  ADJUSTMENT
+  PURCHASE_RECEIPT
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  CONVERTED
+}
+
+enum RFQStatus {
+  DRAFT
+  SENT
+  CLOSED
+  CONVERTED
+  CANCELLED
+}
+
+enum RFQResponseStatus {
+  PENDING
+  SELECTED
+  REJECTED
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+enum JournalSourceType {
+  MANUAL
+  SALES_INVOICE
+  SALES_PAYMENT
+  PURCHASE_INVOICE
+  PURCHASE_RECEIPT
+  PURCHASE_PAYMENT
+  PARTY_PAYMENT
+  EXPENSE_APPROVAL
+  EXPENSE_PAYMENT
+  POS_SALE
+  POS_SALE_COGS
+  PAYROLL_RUN
+  PAYROLL_DISBURSEMENT
+  LOAN_ISSUANCE
+  EOS_ACCRUAL
+}
+
+enum PartyType {
+  CUSTOMER
+  SUPPLIER
+}
+
+enum ExpenseStatus {
+  DRAFT
+  APPROVED
+  PAID
+  REJECTED
+}
+
+enum JournalType {
+  SALE
+  PURCHASE
+  CASH
+  BANK
+  MISC
+}
+
+enum PaymentMethodType {
+  CASH_BANK
+  ACCOUNT_RECEIVABLE
+}
+
+enum PosSessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum PayrollRunStatus {
+  DRAFT
+  PROCESSED
+  PAID
+}
+
+enum EmployeeLoanStatus {
+  ACTIVE
+  CLOSED
+}
+
+// --- CORE TABLES ---
+model User {
+  id          Int          @id @default(autoincrement())
+  email       String       @unique
+  password    String
+  name        String?
+  role        Role         @default(MERCHANDISER)
+  salesOrders SalesOrder[] // A merchandiser can be assigned many sales orders
+  quotations  Quotation[]
+  employee    Employee?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model Warehouse {
+  id             Int             @id @default(autoincrement())
+  name           String
+  location       String?
+  inventories    Inventory[]
+  salesOrders    SalesOrder[] // Sales orders fulfilled by this specific warehouse
+  purchaseOrders PurchaseOrder[] // Purchase orders received into this warehouse
+  quotations     Quotation[]
+  rfqs           RFQ[]
+  posSessions    PosSession[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+model Product {
+  id Int @id @default(autoincrement())
+
+  // --- BARCODES & SKU ---
+  sku        String? @unique
+  barcodePcs String? @unique
+  barcodeBox String? @unique
+
+  name               String
+  description        String?
+  price              Float               @default(0)
+  // Unit cost, used for COGS postings (POS sales). 0 means "not set yet" — no COGS posts until an admin fills this in.
+  costPrice          Float               @default(0)
+  inventories        Inventory[]
+  salesOrderItems    SalesOrderItem[]
+  deliveryItems      DeliveryItem[]
+  invoiceItems       InvoiceItem[]
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  movements          StockMovement[]
+  purchaseOrderItems PurchaseOrderItem[]
+  receiptItems       ReceiptItem[]
+  billItems          BillItem[]
+  quotationItems     QuotationItem[]
+  rfqItems           RFQItem[]
+  rfqResponseItems   RFQResponseItem[]
+  posSaleItems       PosSaleItem[]
+}
+
+model Inventory {
+  id       Int @id @default(autoincrement())
+  quantity Int @default(0)
+
+  // --- NEW: BATCH & EXPIRY TRACKING ---
+  batchNumber String    @default("DEFAULT")
+  expiryDate  DateTime? // Optional, because some products (like hardware) don't expire
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // NEW UNIQUE CONSTRAINT: A warehouse can have multiple of the same product, but not the same batch
+  @@unique([productId, warehouseId, batchNumber])
+}
+
+// --- SALES: Quotation -> SalesOrder -> Delivery(s) -> Invoice(s) -> Payment ---
+// A SalesOrder is the confirmed intent to sell — no stock movement, no billing yet.
+// Delivery is the physical fulfillment (batch/expiry captured, stock deducted) — a SalesOrder
+// can have several Deliveries (partial shipments). Invoice is the billing document (GL posts
+// here) — a SalesOrder can have several Invoices (partial billing), independent of delivery
+// progress (invoicing policy = against ordered quantity, matching Odoo's "Ordered Quantities").
+model SalesOrder {
+  id          Int              @id @default(autoincrement())
+  status      SalesOrderStatus @default(DRAFT)
+  totalAmount Float            @default(0)
+
+  // Who's fulfilling this order? Null for a DRAFT order (converted from a Quotation, not yet confirmed).
+  userId      Int?
+  user        User?            @relation(fields: [userId], references: [id])
+  clientName  String?
+  // Which warehouse is fulfilling this order?
+  warehouseId Int
+  warehouse   Warehouse        @relation(fields: [warehouseId], references: [id])
+  items       SalesOrderItem[]
+  deliveries  Delivery[]
+  invoices    Invoice[]
+
+  // Set when this order was created by converting a Quotation
+  quotation Quotation?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SalesOrderItem {
+  id       Int   @id @default(autoincrement())
+  quantity Int
+  price    Float
+
+  // Running totals so partial deliveries/invoices know how much of this line remains.
+  quantityDelivered Int @default(0)
+  quantityInvoiced  Int @default(0)
+
+  salesOrderId Int
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+
+  deliveryItems DeliveryItem[]
+  invoiceItems  InvoiceItem[]
+}
+
+// --- DELIVERY: the physical shipment/fulfillment event ---
+model Delivery {
+  id           Int            @id @default(autoincrement())
+  status       DeliveryStatus @default(PENDING)
+  salesOrderId Int
+  salesOrder   SalesOrder     @relation(fields: [salesOrderId], references: [id])
+
+  proofOfDelivery String?
+  items           DeliveryItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DeliveryItem {
+  id       Int @id @default(autoincrement())
+  quantity Int
+
+  // Record which exact batch was shipped
+  batchNumber String    @default("DEFAULT")
+  boxBarcode  String?
+  expiryDate  DateTime?
+
+  deliveryId Int
+  delivery   Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+
+  salesOrderItemId Int
+  salesOrderItem   SalesOrderItem @relation(fields: [salesOrderItemId], references: [id])
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// --- INVOICE: the billing document — this is where accounting posts ---
+model Invoice {
+  id            Int        @id @default(autoincrement())
+  invoiceNumber String?    @unique
+  salesOrderId  Int
+  salesOrder    SalesOrder @relation(fields: [salesOrderId], references: [id])
+
+  totalAmount   Float
+  paymentStatus PaymentStatus @default(UNPAID)
+  amountPaid    Float         @default(0)
+  items         InvoiceItem[]
+  payments      Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model InvoiceItem {
+  id       Int   @id @default(autoincrement())
+  quantity Int
+  price    Float
+
+  invoiceId Int
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  salesOrderItemId Int
+  salesOrderItem   SalesOrderItem @relation(fields: [salesOrderItemId], references: [id])
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+model Payment {
+  id         Int      @id @default(autoincrement())
+  invoiceId  Int
+  invoice    Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount     Float
+  method     String?
+  journalId  Int?
+  journal    Journal? @relation(fields: [journalId], references: [id])
+  receivedAt DateTime @default(now())
+}
+
+model StockMovement {
+  id              Int               @id @default(autoincrement())
+  productId       Int
+  batchNumber     String
+  fromWarehouseId Int? // Null if it's a new stock adjustment
+  toWarehouseId   Int? // Null if it's a write-off / damage
+  quantity        Int // The amount moved
+  type            StockMovementType
+  reason          String? // e.g., "Damaged in transit", "Moved to Shop"
+  createdAt       DateTime          @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+// --- PURCHASE ENGINE ---
+model Supplier {
+  id             Int             @id @default(autoincrement())
+  name           String
+  contactPerson  String?
+  phone          String?
+  email          String?
+  address        String?
+  purchaseOrders PurchaseOrder[]
+  rfqResponses   RFQResponse[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+// --- PURCHASE: RFQ -> PurchaseOrder -> Receipt(s) -> Bill(s) -> Payment ---
+// A PurchaseOrder is the confirmed intent to buy — no stock movement, no billing yet.
+// Receipt is the physical goods-receipt (batch/expiry captured, stock added) — a PurchaseOrder
+// can have several Receipts (partial deliveries from the supplier). Bill is the billing document
+// (GL posts here) — a PurchaseOrder can have several Bills (partial billing), independent of
+// receipt progress (billing policy = against ordered quantity, matching the Sales side's Invoice).
+model PurchaseOrder {
+  id          Int                 @id @default(autoincrement())
+  status      PurchaseOrderStatus @default(DRAFT)
+  totalAmount Float               @default(0)
+  reference   String? // Supplier's own invoice/PO number
+
+  supplierId Int
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  items    PurchaseOrderItem[]
+  receipts Receipt[]
+  bills    Bill[]
+
+  // Set when this PO was created by converting a winning RFQ response
+  rfqResponse RFQResponse?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PurchaseOrderItem {
+  id               Int   @id @default(autoincrement())
+  quantityOrdered  Int
+  // Running totals so partial receipts/bills know how much of this line remains.
+  quantityReceived Int   @default(0)
+  quantityBilled   Int   @default(0)
+  unitCost         Float
+
+  purchaseOrderId Int
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+
+  receiptItems ReceiptItem[]
+  billItems    BillItem[]
+}
+
+// --- RECEIPT: the physical goods-receipt event ---
+model Receipt {
+  id              Int           @id @default(autoincrement())
+  receiptNumber   String?       @unique
+  purchaseOrderId Int
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+
+  items ReceiptItem[]
+
+  createdAt DateTime @default(now())
+}
+
+model ReceiptItem {
+  id       Int @id @default(autoincrement())
+  quantity Int
+
+  // Record which exact batch was received
+  batchNumber String    @default("DEFAULT")
+  expiryDate  DateTime?
+
+  receiptId Int
+  receipt   Receipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  purchaseOrderItemId Int
+  purchaseOrderItem   PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id])
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// --- BILL: the billing document — this is where accounting posts ---
+model Bill {
+  id              Int           @id @default(autoincrement())
+  billNumber      String?       @unique
+  purchaseOrderId Int
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+
+  totalAmount   Float
+  paymentStatus PaymentStatus     @default(UNPAID)
+  amountPaid    Float             @default(0)
+  items         BillItem[]
+  payments      PurchasePayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BillItem {
+  id       Int   @id @default(autoincrement())
+  quantity Int
+  // Defaults to the PO's ordered unitCost, editable for real price variance vs. the actual supplier invoice.
+  unitCost Float
+
+  billId Int
+  bill   Bill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  purchaseOrderItemId Int
+  purchaseOrderItem   PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id])
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+model PurchasePayment {
+  id        Int      @id @default(autoincrement())
+  billId    Int
+  bill      Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  amount    Float
+  method    String?
+  journalId Int?
+  journal   Journal? @relation(fields: [journalId], references: [id])
+  paidAt    DateTime @default(now())
+}
+
+// --- QUOTATIONS (pre-sale, converts into an Order) ---
+model Quotation {
+  id          Int             @id @default(autoincrement())
+  status      QuotationStatus @default(DRAFT)
+  clientName  String?
+  totalAmount Float           @default(0)
+  validUntil  DateTime?
+
+  // Merchandiser is chosen later, when the converted draft order is confirmed — not here.
+  userId Int?
+  user   User? @relation(fields: [userId], references: [id])
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  items QuotationItem[]
+
+  // Set once this quotation is converted into a real Sales Order
+  convertedOrderId Int?        @unique
+  convertedOrder   SalesOrder? @relation(fields: [convertedOrderId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model QuotationItem {
+  id       Int   @id @default(autoincrement())
+  quantity Int
+  price    Float
+
+  quotationId Int
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// --- RFQs (multi-supplier comparison, converts into a PurchaseOrder) ---
+model RFQ {
+  id     Int       @id @default(autoincrement())
+  status RFQStatus @default(DRAFT)
+
+  warehouseId Int
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  items     RFQItem[]
+  responses RFQResponse[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model RFQItem {
+  id       Int @id @default(autoincrement())
+  quantity Int
+
+  rfqId Int
+  rfq   RFQ @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+model RFQResponse {
+  id          Int               @id @default(autoincrement())
+  status      RFQResponseStatus @default(PENDING)
+  totalAmount Float             @default(0)
+
+  rfqId Int
+  rfq   RFQ @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+
+  supplierId Int
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  items RFQResponseItem[]
+
+  // Set once this response is picked and converted into a real PurchaseOrder
+  convertedPurchaseOrderId Int?           @unique
+  convertedPurchaseOrder   PurchaseOrder? @relation(fields: [convertedPurchaseOrderId], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+model RFQResponseItem {
+  id       Int   @id @default(autoincrement())
+  unitCost Float
+
+  rfqResponseId Int
+  rfqResponse   RFQResponse @relation(fields: [rfqResponseId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// --- ACCOUNTING (double-entry, auto-posted from Sales/Purchase activity) ---
+model Account {
+  id                Int               @id @default(autoincrement())
+  code              String            @unique
+  name              String
+  type              AccountType
+  // Cosmetic grouping only (e.g. "Current Asset" / "Long-term Liability") — purely for COA display, never read by posting logic.
+  subtype           String?
+  isSystemAccount   Boolean           @default(false)
+  // Deactivated accounts stay for historical journal lines but drop out of pickers for new entries.
+  isActive          Boolean           @default(true)
+  journalLines      JournalLine[]
+  expenseCategories ExpenseCategory[]
+  journalsAsDebit   Journal[]         @relation("JournalDebit")
+  journalsAsCredit  Journal[]         @relation("JournalCredit")
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+}
+
+// --- JOURNALS (Odoo-style: Cash/Bank/Sales/Purchase/Misc) — distinct from JournalEntry (the
+// actual transaction record). Each journal optionally has a default debit/credit account, used
+// to resolve which GL account a payment posts to when the user picks that journal.
+model Journal {
+  id                     Int               @id @default(autoincrement())
+  name                   String
+  code                   String            @unique
+  type                   JournalType
+  sequencePrefix         String
+  defaultDebitAccountId  Int?
+  defaultDebitAccount    Account?          @relation("JournalDebit", fields: [defaultDebitAccountId], references: [id])
+  defaultCreditAccountId Int?
+  defaultCreditAccount   Account?          @relation("JournalCredit", fields: [defaultCreditAccountId], references: [id])
+  isActive               Boolean           @default(true)
+  paymentMethods         PaymentMethod[]
+  journalEntries         JournalEntry[]
+  payments               Payment[]
+  partyPayments          PartyPayment[]
+  purchasePayments       PurchasePayment[]
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+}
+
+// Data-driven payment method -> journal mapping, used by payment forms and POS checkout.
+// CASH_BANK posts through the linked journal's default account; ACCOUNT_RECEIVABLE posts to AR
+// (no journal needed — it's billed on credit).
+model PaymentMethod {
+  id        Int               @id @default(autoincrement())
+  name      String            @unique
+  type      PaymentMethodType @default(CASH_BANK)
+  journalId Int?
+  journal   Journal?          @relation(fields: [journalId], references: [id])
+  isActive  Boolean           @default(true)
+  sortOrder Int               @default(0)
+  posSales  PosSale[]
+}
+
+// --- GENERIC PAYMENTS (record one payment, allocate across multiple open sales invoices or purchase bills) ---
+model PartyPayment {
+  id            Int                      @id @default(autoincrement())
+  // Nullable then filled right after create (same pattern as Order.invoiceNumber) — multiple
+  // NULLs coexist fine under a unique constraint, avoiding a placeholder-value collision race.
+  paymentNumber String?                  @unique
+  partyType     PartyType
+  partyName     String
+  amount        Float
+  method        String?
+  journalId     Int?
+  journal       Journal?                 @relation(fields: [journalId], references: [id])
+  notes         String?
+  allocations   PartyPaymentAllocation[]
+
+  createdAt DateTime @default(now())
+}
+
+model PartyPaymentAllocation {
+  id             Int          @id @default(autoincrement())
+  partyPaymentId Int
+  partyPayment   PartyPayment @relation(fields: [partyPaymentId], references: [id], onDelete: Cascade)
+
+  // Loose reference (not a FK) since it points at either an Order or a PurchaseOrder — same
+  // pattern already used by JournalEntry.sourceId.
+  sourceType      String // 'SALES_INVOICE' | 'PURCHASE_INVOICE'
+  sourceId        Int
+  amountAllocated Float
+}
+
+// --- EXPENSES (separate from Purchase Bills — operating costs like rent, utilities, fuel) ---
+model ExpenseCategory {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique
+  accountId Int
+  account   Account   @relation(fields: [accountId], references: [id])
+  isActive  Boolean   @default(true)
+  expenses  Expense[]
+  createdAt DateTime  @default(now())
+}
+
+model Expense {
+  id            Int             @id @default(autoincrement())
+  // Nullable then filled right after create (same pattern as Order.invoiceNumber) — multiple
+  // NULLs coexist fine under a unique constraint, avoiding a placeholder-value collision race.
+  expenseNumber String?         @unique
+  categoryId    Int
+  category      ExpenseCategory @relation(fields: [categoryId], references: [id])
+  payeeName     String
+  description   String?
+  amount        Float
+  status        ExpenseStatus   @default(DRAFT)
+
+  createdAt  DateTime  @default(now())
+  approvedAt DateTime?
+  paidAt     DateTime?
+}
+
+model JournalEntry {
+  id         Int               @id @default(autoincrement())
+  date       DateTime          @default(now())
+  memo       String?
+  sourceType JournalSourceType @default(MANUAL)
+  sourceId   Int?
+  lines      JournalLine[]
+  createdAt  DateTime          @default(now())
+
+  // Which Journal (Cash/Bank/Sales/Purchase/Misc) this entry posted through — nullable so every
+  // entry posted before this field existed stays valid with no data loss.
+  journalId Int?
+  journal   Journal? @relation(fields: [journalId], references: [id])
+
+  // Set when this entry has been corrected via a reversal — the entry itself is never mutated/deleted.
+  voidedAt     DateTime?
+  // If this entry IS a reversal, points back to the entry it reverses.
+  reversalOfId Int?          @unique
+  reversalOf   JournalEntry? @relation("EntryReversal", fields: [reversalOfId], references: [id])
+  reversedBy   JournalEntry? @relation("EntryReversal")
+}
+
+model JournalLine {
+  id          Int     @id @default(autoincrement())
+  debit       Float   @default(0)
+  credit      Float   @default(0)
+  description String?
+
+  // Set only on AR/AP-touching lines (sales/purchase invoices, payments) — powers the Partner Ledger.
+  // Nullable so pre-existing journal lines (posted before this field existed) stay valid with no data loss.
+  partyType PartyType?
+  partyName String?
+
+  journalEntryId Int
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+
+  accountId Int
+  account   Account @relation(fields: [accountId], references: [id])
+}
+
+// --- POS: lightweight walk-in checkout, separate from the Sales Order chain. No terminals/
+// registers concept, no split payments — one payment method per sale, PIN attribution only
+// (not a login), sessions are simple open/close time markers (no cash-count reconciliation). ---
+model PosStaff {
+  id             Int                @id @default(autoincrement())
+  name           String
+  pinHash        String
+  isActive       Boolean            @default(true)
+  sessionsOpened PosSession[]       @relation("SessionOpenedBy")
+  sessionsClosed PosSession[]       @relation("SessionClosedBy")
+  sales          PosSale[]
+  cancelledSales PosCancelledSale[]
+  createdAt      DateTime           @default(now())
+}
+
+model PosSession {
+  id          Int              @id @default(autoincrement())
+  status      PosSessionStatus @default(OPEN)
+  warehouseId Int
+  warehouse   Warehouse        @relation(fields: [warehouseId], references: [id])
+
+  openedById Int?
+  openedBy   PosStaff? @relation("SessionOpenedBy", fields: [openedById], references: [id])
+  closedById Int?
+  closedBy   PosStaff? @relation("SessionClosedBy", fields: [closedById], references: [id])
+
+  sales PosSale[]
+
+  openedAt DateTime  @default(now())
+  closedAt DateTime?
+}
+
+model PosSale {
+  id            Int     @id @default(autoincrement())
+  invoiceNumber String? @unique
+  totalAmount   Float   @default(0)
+  clientName    String?
+
+  sessionId Int
+  session   PosSession @relation(fields: [sessionId], references: [id])
+
+  warehouseId Int
+
+  paymentMethodId Int
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+
+  servedById Int?
+  servedBy   PosStaff? @relation(fields: [servedById], references: [id])
+
+  items PosSaleItem[]
+
+  createdAt DateTime @default(now())
+}
+
+model PosSaleItem {
+  id          Int    @id @default(autoincrement())
+  quantity    Int
+  price       Float
+  // Snapshot of Product.costPrice at sale time, for COGS posting — insulated from later cost-price edits.
+  costPrice   Float
+  batchNumber String @default("DEFAULT")
+
+  posSaleId Int
+  posSale   PosSale @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
+
+  productId Int
+  product   Product @relation(fields: [productId], references: [id])
+}
+
+// Audit-only cancellation log — matches the reference implementation's behavior of never
+// auto-reversing stock/GL on cancel, just recording that it happened and why.
+model PosCancelledSale {
+  id             Int     @id @default(autoincrement())
+  originalSaleId Int?
+  itemsSummary   Json
+  totalAmount    Float
+  reason         String?
+
+  cancelledById Int?
+  cancelledBy   PosStaff? @relation(fields: [cancelledById], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+// --- PAYROLL: Employee HR records are separate from User login accounts (an Employee may
+// optionally be linked to one, e.g. a merchandiser who is also on payroll, but most won't be).
+// Qatar-specific: GRSIA (retirement/social insurance, Qatari nationals only) and End-of-Service
+// gratuity (non-Qatari, vests at 1 year) are the two statutory calculations this module implements.
+model Employee {
+  id       Int     @id @default(autoincrement())
+  name     String
+  isQatari Boolean @default(false)
+
+  qidNumber          String?
+  qidExpiryDate      DateTime?
+  passportNumber     String?
+  passportExpiryDate DateTime?
+  visaExpiryDate     DateTime?
+  bankName           String?
+  iban               String?
+
+  basicSalary             Float @default(0)
+  housingAllowance        Float @default(0)
+  transportationAllowance Float @default(0)
+  telephoneAllowance      Float @default(0)
+  otherAllowance          Float @default(0)
+
+  payrollActive Boolean  @default(true)
+  hireDate      DateTime @default(now())
+
+  // Optional link if this employee also has a dashboard login (e.g. a merchandiser).
+  userId Int?  @unique
+  user   User? @relation(fields: [userId], references: [id])
+
+  payslips       Payslip[]
+  loans          EmployeeLoan[]
+  eosAccrualLogs EosAccrualLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Single-row settings table (always id=1) — GRSIA %, working hours, overtime multipliers, EOS formula input.
+model PayrollConfig {
+  id                      Int   @id @default(autoincrement())
+  grsiaEmployeePercent    Float @default(5)
+  grsiaEmployerPercent    Float @default(10)
+  workingDaysPerMonth     Float @default(26)
+  workingHoursPerDay      Float @default(8)
+  overtimeMultiplier      Float @default(1.25)
+  nightOvertimeMultiplier Float @default(1.5)
+  eosWeeksPerYear         Float @default(3)
+}
+
+model PayrollRun {
+  id          Int              @id @default(autoincrement())
+  // Nullable then filled right after create (id-based) — multiple NULLs coexist fine under a
+  // unique constraint, avoiding a placeholder-value collision race between concurrent creates.
+  runNo       String?          @unique
+  periodStart DateTime
+  periodEnd   DateTime
+  status      PayrollRunStatus @default(DRAFT)
+
+  totalGross      Float @default(0)
+  totalDeductions Float @default(0)
+  totalNet        Float @default(0)
+
+  // Set once processed/paid — the two journal entries this run posted.
+  journalEntryId        Int?
+  paymentJournalEntryId Int?
+
+  payslips Payslip[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Payslip {
+  id           Int        @id @default(autoincrement())
+  payrollRunId Int
+  payrollRun   PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  basicSalary         Float
+  allowancesTotal     Float @default(0)
+  allowancesBreakdown Json
+
+  overtimeHours      Float @default(0)
+  nightOvertimeHours Float @default(0)
+  overtimeAmount     Float @default(0)
+
+  unpaidLeaveDays      Float @default(0)
+  unpaidLeaveDeduction Float @default(0)
+
+  grossPay Float @default(0)
+
+  // GRSIA only applies to Qatari employees — 0 for everyone else.
+  grsiaEmployeeAmount Float @default(0)
+  grsiaEmployerAmount Float @default(0)
+
+  loanDeduction   Float @default(0)
+  otherDeductions Float @default(0)
+  totalDeductions Float @default(0)
+  netPay          Float @default(0)
+
+  // Snapshot at generation time — insulated from a later change to Employee.isQatari.
+  isQatari Boolean
+
+  loanRepayments EmployeeLoanRepayment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model EmployeeLoan {
+  id     Int     @id @default(autoincrement())
+  // Nullable then filled right after create — same race-avoidance pattern as PayrollRun.runNo.
+  loanNo String? @unique
+
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  principalAmount    Float
+  monthlyDeduction   Float
+  outstandingBalance Float
+  status             EmployeeLoanStatus @default(ACTIVE)
+  journalEntryId     Int?
+
+  repayments EmployeeLoanRepayment[]
+
+  dateIssued DateTime @default(now())
+}
+
+model EmployeeLoanRepayment {
+  id             Int          @id @default(autoincrement())
+  employeeLoanId Int
+  employeeLoan   EmployeeLoan @relation(fields: [employeeLoanId], references: [id], onDelete: Cascade)
+
+  // Null means a manual repayment, not tied to a specific payroll run.
+  payslipId Int?
+  payslip   Payslip? @relation(fields: [payslipId], references: [id])
+
+  amount    Float
+  createdAt DateTime @default(now())
+}
+
+// Live-computed EOS accrual is never stored as a balance — this is an incremental ledger so
+// each monthly post only books the delta since the last one (diffed against the live formula).
+model EosAccrualLog {
+  id         Int      @id @default(autoincrement())
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id])
+
+  amountPosted   Float
+  journalEntryId Int?
+  createdAt      DateTime @default(now())
+}
