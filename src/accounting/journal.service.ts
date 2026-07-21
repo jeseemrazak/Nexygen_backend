@@ -105,7 +105,7 @@ export class JournalService {
     });
   }
 
-  async findAll(filters?: { from?: string; to?: string; accountId?: number; sourceType?: string; search?: string }) {
+  async findAll(filters?: { from?: string; to?: string; accountId?: number; journalId?: number; sourceType?: string; search?: string }) {
     const where: any = {};
 
     const dateFilter: { gte?: Date; lte?: Date } = {};
@@ -115,6 +115,7 @@ export class JournalService {
 
     if (filters?.sourceType) where.sourceType = filters.sourceType;
     if (filters?.accountId) where.lines = { some: { accountId: filters.accountId } };
+    if (filters?.journalId) where.journalId = filters.journalId;
     if (filters?.search) where.memo = { contains: filters.search, mode: 'insensitive' };
 
     return this.prisma.journalEntry.findMany({
@@ -300,6 +301,101 @@ export class JournalService {
       totalAssets: assetLines.reduce((s, l) => s + l.amount, 0),
       totalLiabilities: liabilityLines.reduce((s, l) => s + l.amount, 0),
       totalEquity: equityLines.reduce((s, l) => s + l.amount, 0),
+    };
+  }
+
+  // One-call landing-page summary for the Accounting module — KPI strip + Sales/Purchase/
+  // Payroll document-status cards + per-journal balance/posted-volume, all server-aggregated
+  // (unlike the NEXYGEN ERP reference, which fires ~15 sequential per-account round trips from
+  // the client — everything here is computed in this one request instead).
+  async getDashboardSummary() {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const sixtyDaysAgo = new Date(now.getTime() - 60 * 86400000);
+
+    const [balanceSheet, mtdPL, journals] = await Promise.all([
+      this.getBalanceSheet(),
+      this.getProfitAndLoss(monthStart.toISOString()),
+      this.prisma.journal.findMany({
+        where: { isActive: true },
+        include: { defaultDebitAccount: true, defaultCreditAccount: true },
+        orderBy: { code: 'asc' },
+      }),
+    ]);
+
+    const balanceLines = [...balanceSheet.assetLines, ...balanceSheet.liabilityLines];
+    const amountByCode = (code: string) => balanceLines.find((l) => l.account.code === code)?.amount || 0;
+
+    const kpis = {
+      receivables: amountByCode('1100'),
+      payables: amountByCode('2000'),
+      cashAndBank: amountByCode('1000') + amountByCode('1010'),
+      mtdNetIncome: mtdPL.netProfit,
+    };
+
+    const payroll = {
+      salaryPayable: amountByCode('2200'),
+      grsiaPayable: amountByCode('2210'),
+      eosGratuityAccrual: amountByCode('2220'),
+      employeeAdvances: amountByCode('1300'),
+    };
+
+    const [
+      invoiceCounts,
+      billCounts,
+      invoiceOutstanding,
+      billOutstanding,
+      invoiceOverdue,
+      billOverdue,
+      draftRuns,
+      unpaidRuns,
+    ] = await Promise.all([
+      this.prisma.invoice.groupBy({ by: ['paymentStatus'], _count: true }),
+      this.prisma.bill.groupBy({ by: ['paymentStatus'], _count: true }),
+      this.prisma.invoice.aggregate({ where: { paymentStatus: { not: 'PAID' } }, _sum: { totalAmount: true, amountPaid: true } }),
+      this.prisma.bill.aggregate({ where: { paymentStatus: { not: 'PAID' } }, _sum: { totalAmount: true, amountPaid: true } }),
+      this.prisma.invoice.aggregate({ where: { paymentStatus: { not: 'PAID' }, createdAt: { lt: sixtyDaysAgo } }, _sum: { totalAmount: true, amountPaid: true }, _count: true }),
+      this.prisma.bill.aggregate({ where: { paymentStatus: { not: 'PAID' }, createdAt: { lt: sixtyDaysAgo } }, _sum: { totalAmount: true, amountPaid: true }, _count: true }),
+      this.prisma.payrollRun.count({ where: { status: 'DRAFT' } }),
+      this.prisma.payrollRun.count({ where: { status: 'PROCESSED' } }),
+    ]);
+
+    const countFor = (rows: { paymentStatus: string; _count: number }[], status: string) =>
+      rows.find((r) => r.paymentStatus === status)?._count || 0;
+
+    const docSummary = (
+      counts: typeof invoiceCounts,
+      outstanding: typeof invoiceOutstanding,
+      overdue: typeof invoiceOverdue,
+    ) => ({
+      unpaid: countFor(counts, 'UNPAID'),
+      partial: countFor(counts, 'PARTIAL'),
+      paid: countFor(counts, 'PAID'),
+      outstandingAmount: (outstanding._sum.totalAmount || 0) - (outstanding._sum.amountPaid || 0),
+      overdueCount: overdue._count,
+      overdueAmount: (overdue._sum.totalAmount || 0) - (overdue._sum.amountPaid || 0),
+    });
+
+    const journalRows = await Promise.all(
+      journals.map(async (j) => {
+        if (j.type === 'CASH' || j.type === 'BANK') {
+          const amount = j.defaultDebitAccount ? amountByCode(j.defaultDebitAccount.code) : 0;
+          return { journal: j, amount, isBalance: true };
+        }
+        const { _sum } = await this.prisma.journalLine.aggregate({
+          where: { journalEntry: { journalId: j.id } },
+          _sum: { debit: true },
+        });
+        return { journal: j, amount: _sum.debit || 0, isBalance: false };
+      }),
+    );
+
+    return {
+      kpis,
+      salesInvoices: docSummary(invoiceCounts, invoiceOutstanding, invoiceOverdue),
+      purchaseBills: docSummary(billCounts, billOutstanding, billOverdue),
+      payroll: { ...payroll, draftRuns, unpaidRuns },
+      journals: journalRows,
     };
   }
 }

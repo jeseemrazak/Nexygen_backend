@@ -23,6 +23,7 @@ export class JournalController {
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('accountId') accountId?: string,
+    @Query('journalId') journalId?: string,
     @Query('sourceType') sourceType?: string,
     @Query('search') search?: string,
   ) {
@@ -30,9 +31,15 @@ export class JournalController {
       from,
       to,
       accountId: accountId ? Number(accountId) : undefined,
+      journalId: journalId ? Number(journalId) : undefined,
       sourceType,
       search,
     });
+  }
+
+  @Get('dashboard')
+  getDashboardSummary() {
+    return this.journalService.getDashboardSummary();
   }
 
   @Get('journal-entries/:id')
