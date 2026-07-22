@@ -14,11 +14,18 @@ export class QuotationsService {
   async create(dto: CreateQuotationDto) {
     const totalAmount = dto.items.reduce((sum, i) => sum + i.quantity * i.price, 0);
 
+    let clientName = dto.clientName;
+    if (dto.customerId) {
+      const customer = await this.prisma.customer.findUnique({ where: { id: dto.customerId } });
+      if (customer) clientName = customer.name;
+    }
+
     return this.prisma.quotation.create({
       data: {
         userId: dto.userId,
         warehouseId: dto.warehouseId,
-        clientName: dto.clientName,
+        clientName,
+        customerId: dto.customerId,
         validUntil: dto.validUntil ? new Date(dto.validUntil) : undefined,
         totalAmount,
         items: {
@@ -29,7 +36,7 @@ export class QuotationsService {
           })),
         },
       },
-      include: { items: { include: { product: true } }, user: true, warehouse: true },
+      include: { items: { include: { product: true } }, user: true, warehouse: true, customer: true },
     });
   }
 
@@ -39,7 +46,7 @@ export class QuotationsService {
 
     return this.prisma.quotation.findMany({
       where,
-      include: { items: true, user: { select: { name: true, email: true } }, warehouse: true },
+      include: { items: true, user: { select: { name: true, email: true } }, warehouse: true, customer: true },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -51,6 +58,7 @@ export class QuotationsService {
         items: { include: { product: true } },
         user: { select: { name: true, email: true } },
         warehouse: true,
+        customer: true,
         convertedOrder: true,
       },
     });
@@ -78,6 +86,7 @@ export class QuotationsService {
     const order = await this.salesOrdersService.createFromQuotation({
       warehouseId: quotation.warehouseId,
       clientName: quotation.clientName ?? undefined,
+      customerId: quotation.customerId ?? undefined,
       items: quotation.items.map((i) => ({
         productId: i.productId,
         quantity: i.quantity,

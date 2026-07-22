@@ -22,6 +22,10 @@ export class CreateSalesOrderDto {
   @IsOptional()
   clientName?: string;
 
+  @IsInt()
+  @IsOptional()
+  customerId?: number;
+
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => SalesOrderItemDto)

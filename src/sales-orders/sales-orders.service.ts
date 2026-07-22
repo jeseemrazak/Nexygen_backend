@@ -7,6 +7,7 @@ const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   warehouse: true,
   user: { select: { id: true, name: true, email: true } },
+  customer: true,
   deliveries: { include: { items: { include: { product: true } } }, orderBy: { createdAt: 'desc' as const } },
   invoices: { orderBy: { createdAt: 'desc' as const } },
 };
@@ -20,10 +21,18 @@ export class SalesOrdersService {
   // No stock, no batch, no invoice here — those belong to Delivery/Invoice respectively.
   async create(dto: CreateSalesOrderDto) {
     const totalAmount = dto.items.reduce((sum, i) => sum + i.quantity * i.price, 0);
+
+    let clientName = dto.clientName;
+    if (dto.customerId) {
+      const customer = await this.prisma.customer.findUnique({ where: { id: dto.customerId } });
+      if (customer) clientName = customer.name;
+    }
+
     return this.prisma.salesOrder.create({
       data: {
         warehouseId: dto.warehouseId,
-        clientName: dto.clientName,
+        clientName,
+        customerId: dto.customerId,
         totalAmount,
         items: {
           create: dto.items.map((i) => ({
@@ -38,11 +47,12 @@ export class SalesOrdersService {
   }
 
   // Used internally by QuotationsService.convert() — same shape, just named for that call site.
-  async createFromQuotation(dto: { warehouseId: number; clientName?: string; items: { productId: number; quantity: number; price: number }[]; totalAmount: number }) {
+  async createFromQuotation(dto: { warehouseId: number; clientName?: string; customerId?: number; items: { productId: number; quantity: number; price: number }[]; totalAmount: number }) {
     return this.prisma.salesOrder.create({
       data: {
         warehouseId: dto.warehouseId,
         clientName: dto.clientName,
+        customerId: dto.customerId,
         totalAmount: dto.totalAmount,
         items: {
           create: dto.items.map((i) => ({
@@ -65,6 +75,7 @@ export class SalesOrdersService {
         items: true,
         warehouse: true,
         user: { select: { name: true, email: true } },
+        customer: true,
       },
       orderBy: { createdAt: 'desc' },
     });

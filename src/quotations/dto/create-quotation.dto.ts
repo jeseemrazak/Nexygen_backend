@@ -26,6 +26,10 @@ export class CreateQuotationDto {
   @IsOptional()
   clientName?: string;
 
+  @IsInt()
+  @IsOptional()
+  customerId?: number;
+
   @IsDateString()
   @IsOptional()
   validUntil?: string;

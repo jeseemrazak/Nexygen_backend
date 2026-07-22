@@ -228,6 +228,10 @@ model SalesOrder {
   userId      Int?
   user        User?            @relation(fields: [userId], references: [id])
   clientName  String?
+  // Optional link to the Customer directory — clientName stays the source of truth for
+  // aging/ledger matching, this just remembers which saved customer it came from.
+  customerId  Int?
+  customer    Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
   // Which warehouse is fulfilling this order?
   warehouseId Int
   warehouse   Warehouse        @relation(fields: [warehouseId], references: [id])
@@ -365,6 +369,20 @@ model Supplier {
   updatedAt      DateTime        @updatedAt
 }
 
+// --- SALES: Customer directory (analogous to Supplier on the Purchase side) ---
+model Customer {
+  id            Int          @id @default(autoincrement())
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  quotations    Quotation[]
+  salesOrders   SalesOrder[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
 // --- PURCHASE: RFQ -> PurchaseOrder -> Receipt(s) -> Bill(s) -> Payment ---
 // A PurchaseOrder is the confirmed intent to buy — no stock movement, no billing yet.
 // Receipt is the physical goods-receipt (batch/expiry captured, stock added) — a PurchaseOrder
@@ -491,6 +509,10 @@ model Quotation {
   id          Int             @id @default(autoincrement())
   status      QuotationStatus @default(DRAFT)
   clientName  String?
+  // Optional link to the Customer directory — clientName stays the source of truth for
+  // aging/ledger matching, this just remembers which saved customer it came from.
+  customerId  Int?
+  customer    Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
   totalAmount Float           @default(0)
   validUntil  DateTime?
 
@@ -960,6 +982,40 @@ model EmployeeLoanRepayment {
 
   amount    Float
   createdAt DateTime @default(now())
+}
+
+// Single-row settings table — created lazily with defaults on first read/write (same pattern as
+// PayrollConfig). Feeds the letterhead (logo + company info) on every printed document/report, and
+// the Report Designer's global styling knobs. Per-report column visibility lives in reportFieldsJson
+// keyed by report type (e.g. { trialBalance: ["code","name",...] }) so adding a new toggle never
+// needs a migration.
+model CompanySettings {
+  id                 Int     @id @default(autoincrement())
+  name               String  @default("")
+  address            String?
+  phone              String?
+  email              String?
+  website            String?
+  taxNumber          String?
+  logoUrl            String?
+  footerNote         String?
+  termsAndConditions String?
+
+  reportShowLogo    Boolean @default(true)
+  reportShowAddress Boolean @default(true)
+  reportShowPhone   Boolean @default(true)
+  reportShowEmail   Boolean @default(true)
+  reportShowWebsite Boolean @default(true)
+  reportShowFooter  Boolean @default(false)
+
+  reportHeaderColor String @default("E0E0E0")
+  reportAccentColor String @default("0D9488")
+  reportOrientation String @default("portrait")
+  reportDensity     String @default("normal")
+  reportBorderStyle String @default("bordered")
+  reportFieldsJson  Json   @default("{}")
+
+  updatedAt DateTime @updatedAt
 }
 
 // Live-computed EOS accrual is never stored as a balance — this is an incremental ledger so

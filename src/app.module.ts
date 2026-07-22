@@ -13,6 +13,7 @@ import { AuthModule } from './auth/auth.module';
 import { WarehousesModule } from './warehouses/warehouses.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { SuppliersModule } from './suppliers/suppliers.module';
+import { CustomersModule } from './customers/customers.module';
 import { PurchaseOrdersModule } from './purchase-orders/purchase-orders.module';
 import { ReceiptsModule } from './receipts/receipts.module';
 import { BillsModule } from './bills/bills.module';
@@ -23,6 +24,7 @@ import { ExpensesModule } from './expenses/expenses.module';
 import { PartyPaymentsModule } from './party-payments/party-payments.module';
 import { PosModule } from './pos/pos.module';
 import { PayrollModule } from './payroll/payroll.module';
+import { SettingsModule } from './settings/settings.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
@@ -40,6 +42,7 @@ import { RolesGuard } from './auth/roles.guard';
     WarehousesModule,
     InventoryModule,
     SuppliersModule,
+    CustomersModule,
     PurchaseOrdersModule,
     ReceiptsModule,
     BillsModule,
@@ -50,6 +53,7 @@ import { RolesGuard } from './auth/roles.guard';
     PartyPaymentsModule,
     PosModule,
     PayrollModule,
+    SettingsModule,
   ],
   controllers: [AppController],
   providers: [

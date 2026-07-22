@@ -34,11 +34,57 @@ export class PartyPaymentsService {
     });
   }
 
+  // Unifies all three payment paths in this app into one list: the generic multi-document
+  // PartyPayment (this module's own `create()`), plus the direct single-document payments
+  // recorded straight from an Invoice or Bill's detail page (Payment/PurchasePayment) — those
+  // never touch PartyPayment, so without this merge they'd silently never show up here even
+  // though they post to the GL correctly.
   async findAll() {
-    return this.prisma.partyPayment.findMany({
-      include: { allocations: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const [partyPayments, invoicePayments, billPayments] = await Promise.all([
+      this.prisma.partyPayment.findMany({ include: { allocations: true }, orderBy: { createdAt: 'desc' } }),
+      this.prisma.payment.findMany({ include: { invoice: { include: { salesOrder: true } } }, orderBy: { receivedAt: 'desc' } }),
+      this.prisma.purchasePayment.findMany({ include: { bill: { include: { purchaseOrder: { include: { supplier: true } } } } }, orderBy: { paidAt: 'desc' } }),
+    ]);
+
+    const unified = [
+      ...partyPayments.map((p) => ({
+        id: p.id,
+        source: 'PARTY' as const,
+        paymentNumber: p.paymentNumber,
+        partyType: p.partyType,
+        partyName: p.partyName,
+        amount: p.amount,
+        method: p.method,
+        createdAt: p.createdAt,
+        documentCount: p.allocations.length,
+      })),
+      ...invoicePayments.map((p) => ({
+        id: p.id,
+        source: 'SALES_INVOICE' as const,
+        paymentNumber: `INV-PAY-${String(p.id).padStart(6, '0')}`,
+        partyType: 'CUSTOMER' as const,
+        partyName: p.invoice.salesOrder?.clientName || 'Walk-in',
+        amount: p.amount,
+        method: p.method,
+        createdAt: p.receivedAt,
+        documentCount: 1,
+        invoiceId: p.invoiceId,
+      })),
+      ...billPayments.map((p) => ({
+        id: p.id,
+        source: 'PURCHASE_BILL' as const,
+        paymentNumber: `BILL-PAY-${String(p.id).padStart(6, '0')}`,
+        partyType: 'SUPPLIER' as const,
+        partyName: p.bill.purchaseOrder.supplier.name,
+        amount: p.amount,
+        method: p.method,
+        createdAt: p.paidAt,
+        documentCount: 1,
+        billId: p.billId,
+      })),
+    ];
+
+    return unified.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 
   async findOne(id: number) {
