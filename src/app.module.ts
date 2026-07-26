@@ -25,6 +25,15 @@ import { PartyPaymentsModule } from './party-payments/party-payments.module';
 import { PosModule } from './pos/pos.module';
 import { PayrollModule } from './payroll/payroll.module';
 import { SettingsModule } from './settings/settings.module';
+import { ProductCategoriesModule } from './product-categories/product-categories.module';
+import { PosCategoriesModule } from './pos-categories/pos-categories.module';
+import { UnitsOfMeasurementModule } from './units-of-measurement/units-of-measurement.module';
+import { DashboardModule } from './dashboard/dashboard.module';
+import { AppModulesModule } from './app-modules/app-modules.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
+import { VehiclesModule } from './vehicles/vehicles.module';
+import { JobOrdersModule } from './job-orders/job-orders.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
@@ -54,6 +63,15 @@ import { RolesGuard } from './auth/roles.guard';
     PosModule,
     PayrollModule,
     SettingsModule,
+    ProductCategoriesModule,
+    PosCategoriesModule,
+    UnitsOfMeasurementModule,
+    DashboardModule,
+    AppModulesModule,
+    NotificationsModule,
+    LoyaltyModule,
+    VehiclesModule,
+    JobOrdersModule,
   ],
   controllers: [AppController],
   providers: [

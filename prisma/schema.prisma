@@ -26,6 +26,11 @@ enum DeliveryStatus {
   CANCELLED
 }
 
+enum ProductType {
+  GOODS
+  SERVICE
+}
+
 enum PaymentStatus {
   UNPAID
   PARTIAL
@@ -88,10 +93,12 @@ enum JournalSourceType {
   EXPENSE_PAYMENT
   POS_SALE
   POS_SALE_COGS
+  SALES_DELIVERY_COGS
   PAYROLL_RUN
   PAYROLL_DISBURSEMENT
   LOAN_ISSUANCE
   EOS_ACCRUAL
+  STOCK_ADJUSTMENT
 }
 
 enum PartyType {
@@ -137,16 +144,17 @@ enum EmployeeLoanStatus {
 
 // --- CORE TABLES ---
 model User {
-  id          Int          @id @default(autoincrement())
-  email       String       @unique
-  password    String
-  name        String?
-  role        Role         @default(MERCHANDISER)
-  salesOrders SalesOrder[] // A merchandiser can be assigned many sales orders
-  quotations  Quotation[]
-  employee    Employee?
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  id                    Int          @id @default(autoincrement())
+  email                 String       @unique
+  password              String
+  name                  String?
+  role                  Role         @default(MERCHANDISER)
+  salesOrders           SalesOrder[] // A merchandiser can be assigned many sales orders
+  quotations            Quotation[]
+  employee              Employee?
+  jobOrdersAsTechnician JobOrder[]
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 }
 
 model Warehouse {
@@ -159,6 +167,7 @@ model Warehouse {
   quotations     Quotation[]
   rfqs           RFQ[]
   posSessions    PosSession[]
+  jobOrders      JobOrder[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 }
@@ -176,6 +185,17 @@ model Product {
   price              Float               @default(0)
   // Unit cost, used for COGS postings (POS sales). 0 means "not set yet" — no COGS posts until an admin fills this in.
   costPrice          Float               @default(0)
+  // A Service skips warehouse/stock/batch requirements entirely on the Sales side (Delivery, POS)
+  // — appropriate for labor/installation/fee line items with nothing to hold in a warehouse.
+  type               ProductType         @default(GOODS)
+  // Defaults true so no existing product silently disappears from the POS checkout grid.
+  posActive          Boolean             @default(true)
+  categoryId         Int?
+  category           ProductCategory?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  posCategoryId      Int?
+  posCategory        PosCategory?        @relation(fields: [posCategoryId], references: [id], onDelete: SetNull)
+  unitId             Int?
+  unit               UnitOfMeasurement?  @relation(fields: [unitId], references: [id], onDelete: SetNull)
   inventories        Inventory[]
   salesOrderItems    SalesOrderItem[]
   deliveryItems      DeliveryItem[]
@@ -190,6 +210,7 @@ model Product {
   rfqItems           RFQItem[]
   rfqResponseItems   RFQResponseItem[]
   posSaleItems       PosSaleItem[]
+  jobOrderParts      JobOrderPart[]
 }
 
 model Inventory {
@@ -199,6 +220,13 @@ model Inventory {
   // --- NEW: BATCH & EXPIRY TRACKING ---
   batchNumber String    @default("DEFAULT")
   expiryDate  DateTime? // Optional, because some products (like hardware) don't expire
+
+  // Actual landed cost for this specific batch (from PurchaseOrderItem.unitCost at receipt
+  // time) — 0 means "not tracked yet" (pre-existing rows, or stock added outside a Receipt),
+  // in which case valuation/COGS callers fall back to Product.costPrice. This is what lets
+  // stock valuation and COGS reflect what was actually paid per batch instead of a single
+  // mutable Product-level number that drifts once supplier prices change.
+  unitCost Float @default(0)
 
   productId Int
   product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
@@ -222,7 +250,18 @@ model Inventory {
 model SalesOrder {
   id          Int              @id @default(autoincrement())
   status      SalesOrderStatus @default(DRAFT)
+  // Sum of net line totals BEFORE the discountType/discountValue below is applied — the base
+  // the global discount computes from. totalAmount stays what it already meant: the final total.
+  subtotal    Float            @default(0)
   totalAmount Float            @default(0)
+
+  // Global (whole-document) discount — 'PERCENT' or 'AMOUNT'. Null/0 = no discount.
+  discountType  String?
+  discountValue Float   @default(0)
+
+  termsAndConditions String?
+  // Customer's own PO/reference number for this order — free text.
+  customerReference  String?
 
   // Who's fulfilling this order? Null for a DRAFT order (converted from a Quotation, not yet confirmed).
   userId      Int?
@@ -249,7 +288,15 @@ model SalesOrder {
 model SalesOrderItem {
   id       Int   @id @default(autoincrement())
   quantity Int
+  // Final NET unit price (after any line discount below) — everything downstream (Invoice, GL)
+  // reads this field exactly as before; discount handling never leaves this service.
   price    Float
+
+  // Original unit price before the line discount. Null = no line discount was applied, so
+  // `price` IS the list price.
+  listPrice         Float?
+  lineDiscountType  String?
+  lineDiscountValue Float   @default(0)
 
   // Running totals so partial deliveries/invoices know how much of this line remains.
   quantityDelivered Int @default(0)
@@ -371,16 +418,117 @@ model Supplier {
 
 // --- SALES: Customer directory (analogous to Supplier on the Purchase side) ---
 model Customer {
-  id            Int          @id @default(autoincrement())
-  name          String
-  contactPerson String?
-  phone         String?
-  email         String?
-  address       String?
-  quotations    Quotation[]
-  salesOrders   SalesOrder[]
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  id                  Int                  @id @default(autoincrement())
+  name                String
+  contactPerson       String?
+  phone               String?
+  email               String?
+  address             String?
+  quotations          Quotation[]
+  salesOrders         SalesOrder[]
+  posSales            PosSale[]
+  loyaltyTransactions LoyaltyTransaction[]
+  vehicles            Vehicle[]
+  jobOrders           JobOrder[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+}
+
+// --- APP STORE: Vehicle Management + Job Order (both installable independently) ---
+model Vehicle {
+  id          Int        @id @default(autoincrement())
+  plateNumber String     @unique
+  make        String?
+  model       String?
+  year        Int?
+  color       String?
+  vin         String?
+  customerId  Int?
+  customer    Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  notes       String?
+  jobOrders   JobOrder[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+enum JobOrderStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model JobOrder {
+  id              Int             @id @default(autoincrement())
+  jobNumber       String          @unique
+  status          JobOrderStatus  @default(OPEN)
+  vehicleId       Int
+  vehicle         Vehicle         @relation(fields: [vehicleId], references: [id])
+  // Snapshot of the vehicle's owner at creation time — same "store it, don't just infer it"
+  // convention as PosSale.clientName next to customerId.
+  customerId      Int?
+  customer        Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  technicianId    Int?
+  technician      User?           @relation(fields: [technicianId], references: [id], onDelete: SetNull)
+  warehouseId     Int
+  warehouse       Warehouse       @relation(fields: [warehouseId], references: [id])
+  description     String?
+  odometerReading Int?
+  notes           String?
+  partsTotal      Float           @default(0)
+  laborTotal      Float           @default(0)
+  totalAmount     Float           @default(0)
+  parts           JobOrderPart[]
+  laborLines      JobOrderLabor[]
+  completedAt     DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model JobOrderPart {
+  id          Int      @id @default(autoincrement())
+  jobOrderId  Int
+  jobOrder    JobOrder @relation(fields: [jobOrderId], references: [id])
+  productId   Int
+  product     Product  @relation(fields: [productId], references: [id])
+  batchNumber String
+  quantity    Int
+  unitPrice   Float
+  costPrice   Float
+  createdAt   DateTime @default(now())
+}
+
+model JobOrderLabor {
+  id          Int      @id @default(autoincrement())
+  jobOrderId  Int
+  jobOrder    JobOrder @relation(fields: [jobOrderId], references: [id])
+  description String
+  hours       Float?
+  rate        Float?
+  amount      Float
+  createdAt   DateTime @default(now())
+}
+
+enum LoyaltyTransactionType {
+  EARN
+  REDEEM
+  ADJUST
+}
+
+// Balance is never stored directly — same incremental-ledger convention as EOS gratuity accrual:
+// always the sum of this table's `points` for a customer, never a mutable counter that can drift.
+model LoyaltyTransaction {
+  id         Int                    @id @default(autoincrement())
+  customerId Int
+  customer   Customer               @relation(fields: [customerId], references: [id])
+  points     Int
+  type       LoyaltyTransactionType
+  note       String?
+  sourceType String?
+  sourceId   Int?
+  createdAt  DateTime               @default(now())
+
+  @@index([customerId])
 }
 
 // --- PURCHASE: RFQ -> PurchaseOrder -> Receipt(s) -> Bill(s) -> Payment ---
@@ -513,8 +661,18 @@ model Quotation {
   // aging/ledger matching, this just remembers which saved customer it came from.
   customerId  Int?
   customer    Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  // Sum of net line totals BEFORE the discountType/discountValue below is applied.
+  subtotal    Float           @default(0)
   totalAmount Float           @default(0)
   validUntil  DateTime?
+
+  // Global (whole-document) discount — 'PERCENT' or 'AMOUNT'. Null/0 = no discount.
+  discountType  String?
+  discountValue Float   @default(0)
+
+  termsAndConditions String?
+  // Customer's own PO/reference number for this quotation — free text.
+  customerReference  String?
 
   // Merchandiser is chosen later, when the converted draft order is confirmed — not here.
   userId Int?
@@ -536,7 +694,13 @@ model Quotation {
 model QuotationItem {
   id       Int   @id @default(autoincrement())
   quantity Int
+  // Final NET unit price (after any line discount below).
   price    Float
+
+  // Original unit price before the line discount. Null = no line discount was applied.
+  listPrice         Float?
+  lineDiscountType  String?
+  lineDiscountValue Float   @default(0)
 
   quotationId Int
   quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
@@ -617,8 +781,39 @@ model Account {
   expenseCategories ExpenseCategory[]
   journalsAsDebit   Journal[]         @relation("JournalDebit")
   journalsAsCredit  Journal[]         @relation("JournalCredit")
+  accountMappings   AccountMapping[]
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
+}
+
+// Every automatic GL posting site (deliveries, POS, invoices, payroll, stock adjustments, ...)
+// resolves the account it posts to via one of these roles instead of a hardcoded CoA code, so an
+// admin can remap the destination account per role from Settings without touching code.
+enum AccountMappingRole {
+  CASH_BANK
+  ACCOUNTS_RECEIVABLE
+  ACCOUNTS_PAYABLE
+  INVENTORY
+  STOCK_INTERIM
+  COGS
+  INVENTORY_ADJUSTMENT
+  SALES_REVENUE
+  EXPENSES_PAYABLE
+  SALARY_EXPENSE
+  GRSIA_EMPLOYER_EXPENSE
+  GRSIA_PAYABLE
+  EMPLOYEE_ADVANCES_RECEIVABLE
+  SALARY_PAYABLE
+  EOS_GRATUITY_EXPENSE
+  EOS_GRATUITY_ACCRUAL
+}
+
+model AccountMapping {
+  id        Int                @id @default(autoincrement())
+  role      AccountMappingRole @unique
+  accountId Int
+  account   Account            @relation(fields: [accountId], references: [id])
+  updatedAt DateTime           @updatedAt
 }
 
 // --- JOURNALS (Odoo-style: Cash/Bank/Sales/Purchase/Misc) — distinct from JournalEntry (the
@@ -686,6 +881,35 @@ model PartyPaymentAllocation {
   sourceType      String // 'SALES_INVOICE' | 'PURCHASE_INVOICE'
   sourceId        Int
   amountAllocated Float
+}
+
+// --- PRODUCT / POS CATEGORIES (two independent lists — a product's catalog grouping for
+// reporting can differ from how it's grouped on the POS checkout screen) ---
+model ProductCategory {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique
+  isActive  Boolean   @default(true)
+  products  Product[]
+  createdAt DateTime  @default(now())
+}
+
+model PosCategory {
+  id        Int       @id @default(autoincrement())
+  name      String    @unique
+  isActive  Boolean   @default(true)
+  // Controls tab/section order on the POS checkout screen.
+  sortOrder Int       @default(0)
+  products  Product[]
+  createdAt DateTime  @default(now())
+}
+
+model UnitOfMeasurement {
+  id           Int       @id @default(autoincrement())
+  name         String    @unique
+  abbreviation String
+  isActive     Boolean   @default(true)
+  products     Product[]
+  createdAt    DateTime  @default(now())
 }
 
 // --- EXPENSES (separate from Purchase Bills — operating costs like rent, utilities, fuel) ---
@@ -786,13 +1010,27 @@ model PosSession {
 
   openedAt DateTime  @default(now())
   closedAt DateTime?
+
+  // Till reconciliation — all optional so existing/simple sessions (no cash count taken) keep
+  // working unchanged. expectedCash/cashVariance are server-computed at close time, never
+  // client-supplied, so they can't be spoofed to hide a shortfall.
+  openingCash  Float?
+  expectedCash Float?
+  countedCash  Float?
+  cashVariance Float?
 }
 
 model PosSale {
-  id            Int     @id @default(autoincrement())
-  invoiceNumber String? @unique
-  totalAmount   Float   @default(0)
-  clientName    String?
+  id             Int     @id @default(autoincrement())
+  invoiceNumber  String? @unique
+  totalAmount    Float   @default(0)
+  discountAmount Float   @default(0)
+  clientName     String?
+
+  // Optional link to the Customer directory — clientName stays the source of truth for
+  // aging/ledger matching, this just remembers which saved customer it came from.
+  customerId Int?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
 
   sessionId Int
   session   PosSession @relation(fields: [sessionId], references: [id])
@@ -806,6 +1044,10 @@ model PosSale {
   servedBy   PosStaff? @relation(fields: [servedById], references: [id])
 
   items PosSaleItem[]
+
+  // Set when this sale is cancelled — restocks inventory and reverses the GL postings at the
+  // same time (unlike the audit-only PosCancelledSale log, which just records that it happened).
+  cancelledAt DateTime?
 
   createdAt DateTime @default(now())
 }
@@ -1015,7 +1257,31 @@ model CompanySettings {
   reportBorderStyle String @default("bordered")
   reportFieldsJson  Json   @default("{}")
 
+  // POS checkout defaults — plain scalar IDs, not FK relations, since a stale reference (the
+  // default warehouse/payment method later gets deleted) should just fail to preselect on the
+  // checkout screen, not block deleting that warehouse/payment method or require a migration.
+  posDefaultWarehouseId     Int?
+  posDefaultPaymentMethodId Int?
+  posRequireCustomer        Boolean @default(false)
+  posReceiptFooter          String?
+  posAutoPrintReceipt       Boolean @default(false)
+  posMaxDiscountPercent     Float?
+  posRequireCashCount       Boolean @default(false)
+
   updatedAt DateTime @updatedAt
+}
+
+// The "App Store" — first-party modules ship in this same codebase (see src/app-modules/module-catalog.ts
+// for the catalog) but stay dormant until installed here. One row per module `key`; `config` holds
+// whatever that module's settings form collects (API keys, toggles) as free-form JSON since each
+// module's shape is different and none of it is queried relationally.
+model InstalledModule {
+  id          Int       @id @default(autoincrement())
+  key         String    @unique
+  isActive    Boolean   @default(false)
+  config      Json?
+  installedAt DateTime?
+  updatedAt   DateTime  @updatedAt
 }
 
 // Live-computed EOS accrual is never stored as a balance — this is an incremental ledger so
