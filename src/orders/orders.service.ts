@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { DeliveryStatus } from '@prisma/client';
+import { resolveDateRange } from '../common/date-range.util';
 
 // Backward-compatibility shim: the live mobile app (distribution_mobile) and the dashboard
 // home page only ever call the 4 endpoints below, and both expect the exact response shapes
@@ -58,28 +59,9 @@ export class OrdersService {
   // 💻 Dashboard home page KPIs. "Orders" in this view means Deliveries — each one already
   // carries its own status/proofOfDelivery/timestamps, same shape the page has always rendered.
   async getDashboardSummary(query?: any) {
-    const { range, startDate, endDate, merchandiserId, status } = query || {};
+    const { merchandiserId, status } = query || {};
 
-    let dateFilter: any = undefined;
-    const now = new Date();
-
-    if (range === 'today') {
-      const start = new Date(now.setHours(0, 0, 0, 0));
-      dateFilter = { gte: start };
-    } else if (range === 'yesterday') {
-      const start = new Date(now); start.setDate(start.getDate() - 1); start.setHours(0, 0, 0, 0);
-      const end = new Date(now); end.setDate(end.getDate() - 1); end.setHours(23, 59, 59, 999);
-      dateFilter = { gte: start, lte: end };
-    } else if (range === 'week') {
-      const start = new Date(now); start.setDate(start.getDate() - 7); start.setHours(0, 0, 0, 0);
-      dateFilter = { gte: start };
-    } else if (range === 'month') {
-      const start = new Date(now.getFullYear(), now.getMonth(), 1);
-      dateFilter = { gte: start };
-    } else if (range === 'custom' && startDate && endDate) {
-      dateFilter = { gte: new Date(startDate), lte: new Date(endDate + 'T23:59:59.999Z') };
-    }
-
+    const dateFilter = resolveDateRange(query);
     const baseWhere = dateFilter ? { createdAt: dateFilter } : {};
 
     const totalOrders = await this.prisma.delivery.count({ where: baseWhere });

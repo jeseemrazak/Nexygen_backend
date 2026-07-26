@@ -2,6 +2,9 @@ import { Controller, Get, Post, Patch, Delete, Body, Param, Query } from '@nestj
 import { JournalsService } from './journals.service';
 import { CreateJournalDto } from './dto/create-journal.dto';
 import { UpdateJournalDto } from './dto/update-journal.dto';
+import { Roles } from '../auth/roles.decorator';
+
+@Roles('ADMIN')
 @Controller('accounting/journals')
 export class JournalsController {
   constructor(private readonly journalsService: JournalsService) {}

@@ -4,6 +4,7 @@ import { diskStorage } from 'multer';
 import { extname } from 'path';
 import { OrdersService } from './orders.service';
 import { DeliveryStatus } from '@prisma/client';
+import { assertValidImageFile } from '../common/file-validation';
 
 // Backward-compatibility shim — see orders.service.ts. Only the 4 routes the mobile app and
 // dashboard home page actually call. Everything else lives in sales-orders/deliveries/invoices now.
@@ -48,6 +49,7 @@ export class OrdersController {
     @Body('status') status: DeliveryStatus,
     @UploadedFile() file?: Express.Multer.File,
   ) {
+    if (file) assertValidImageFile(file.path);
     const filePath = file ? `/uploads/signatures/${file.filename}` : null;
     return this.ordersService.updateOrderStatus(Number(id), status, filePath);
   }

@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreateBillDto } from './dto/create-bill.dto';
@@ -62,18 +63,24 @@ export class BillsService {
             unitCost: reqItem.unitCost ?? poItem.unitCost,
           },
         });
-        await tx.purchaseOrderItem.update({
-          where: { id: poItem.id },
+        // Guard is the WHERE clause (current DB value vs. a precomputed threshold), not the
+        // pre-transaction `remaining` check above — two concurrent bills against the same PO
+        // item can't both pass that check and jointly over-bill past the ordered quantity.
+        const claimed = await tx.purchaseOrderItem.updateMany({
+          where: { id: poItem.id, quantityBilled: { lte: poItem.quantityOrdered - reqItem.quantity } },
           data: { quantityBilled: { increment: reqItem.quantity } },
         });
+        if (claimed.count === 0) {
+          throw new BadRequestException(`Cannot bill ${reqItem.quantity} for item ${poItem.id}; exceeds ordered quantity`);
+        }
       }
 
       // 💰 Auto-post: Dr Stock Interim (Received) / Cr Accounts Payable — converts the
       // accrued-but-unbilled liability into a real, billed one owed to the supplier.
       if (totalAmount > 0) {
         const [stockInterimAccountId, apAccountId] = await Promise.all([
-          this.journalService.getAccountIdByCode(tx, '2050'),
-          this.journalService.getAccountIdByCode(tx, '2000'),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.STOCK_INTERIM),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_PAYABLE),
         ]);
         await this.journalService.postEntry(tx, {
           sourceType: 'PURCHASE_INVOICE',
@@ -109,14 +116,22 @@ export class BillsService {
       const bill = await tx.bill.findUnique({ where: { id: billId }, include: { purchaseOrder: { include: { supplier: true } } } });
       if (!bill) throw new NotFoundException(`Bill ${billId} not found`);
 
+      const { _sum: existingSum } = await tx.purchasePayment.aggregate({ where: { billId }, _sum: { amount: true } });
+      const currentPaid = existingSum.amount || 0;
+      if (currentPaid + dto.amount > bill.totalAmount + 0.01) {
+        throw new BadRequestException(
+          `Payment of ${dto.amount} would exceed the outstanding balance of ${(bill.totalAmount - currentPaid).toFixed(2)}`,
+        );
+      }
+
       await tx.purchasePayment.create({
         data: { billId, amount: dto.amount, method: dto.method, journalId: dto.journalId },
       });
 
       // 💰 Auto-post: Dr Accounts Payable / Cr Cash/Bank (journal-resolved).
       const [apAccountId, cashAccountId] = await Promise.all([
-        this.journalService.getAccountIdByCode(tx, '2000'),
-        this.journalService.resolveJournalAccount(tx, dto.journalId, 'credit', '1000'),
+        this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_PAYABLE),
+        this.journalService.resolveJournalAccount(tx, dto.journalId, 'credit', AccountMappingRole.CASH_BANK),
       ]);
       await this.journalService.postEntry(tx, {
         sourceType: 'PURCHASE_PAYMENT',

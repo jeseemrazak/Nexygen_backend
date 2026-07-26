@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreateReceiptDto } from './dto/create-receipt.dto';
@@ -63,6 +64,22 @@ export class ReceiptsService {
           },
         });
 
+        // Weighted-average the landed cost when receiving more into a batch that already has
+        // stock at a different cost (normal in wholesale — supplier prices change between
+        // receipts) — a plain increment would silently keep the older cost and misstate value.
+        const existingInv = await tx.inventory.findUnique({
+          where: {
+            productId_warehouseId_batchNumber: {
+              productId: poItem.productId,
+              warehouseId: po.warehouseId,
+              batchNumber: reqItem.batchNumber,
+            },
+          },
+        });
+        const blendedUnitCost = existingInv
+          ? (existingInv.quantity * existingInv.unitCost + reqItem.quantity * poItem.unitCost) / (existingInv.quantity + reqItem.quantity)
+          : poItem.unitCost;
+
         await tx.inventory.upsert({
           where: {
             productId_warehouseId_batchNumber: {
@@ -71,20 +88,27 @@ export class ReceiptsService {
               batchNumber: reqItem.batchNumber,
             },
           },
-          update: { quantity: { increment: reqItem.quantity } },
+          update: { quantity: { increment: reqItem.quantity }, unitCost: blendedUnitCost },
           create: {
             productId: poItem.productId,
             warehouseId: po.warehouseId,
             batchNumber: reqItem.batchNumber,
             quantity: reqItem.quantity,
+            unitCost: poItem.unitCost,
             expiryDate,
           },
         });
 
-        await tx.purchaseOrderItem.update({
-          where: { id: poItem.id },
+        // Guard is the WHERE clause (current DB value vs. a precomputed threshold), not the
+        // pre-transaction `remaining` check above — two concurrent receipts against the same PO
+        // item can't both pass that check and jointly over-receive past quantityOrdered.
+        const claimed = await tx.purchaseOrderItem.updateMany({
+          where: { id: poItem.id, quantityReceived: { lte: poItem.quantityOrdered - reqItem.quantity } },
           data: { quantityReceived: { increment: reqItem.quantity } },
         });
+        if (claimed.count === 0) {
+          throw new BadRequestException(`Cannot receive ${reqItem.quantity} for item ${poItem.id}; exceeds ordered quantity`);
+        }
 
         await tx.stockMovement.create({
           data: {
@@ -104,8 +128,8 @@ export class ReceiptsService {
       // moment goods physically arrive, before the supplier's actual bill is recorded.
       if (receiptValue > 0) {
         const [inventoryAccountId, stockInterimAccountId] = await Promise.all([
-          this.journalService.getAccountIdByCode(tx, '1200'),
-          this.journalService.getAccountIdByCode(tx, '2050'),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.STOCK_INTERIM),
         ]);
         await this.journalService.postEntry(tx, {
           sourceType: 'PURCHASE_RECEIPT',

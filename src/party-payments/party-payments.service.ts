@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreatePartyPaymentDto } from './dto/create-party-payment.dto';
@@ -87,10 +88,89 @@ export class PartyPaymentsService {
     return unified.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 
-  async findOne(id: number) {
-    const payment = await this.prisma.partyPayment.findUnique({ where: { id }, include: { allocations: true } });
+  // `source` disambiguates which of the three payment tables `id` refers to — ids are not
+  // unique across PartyPayment/Payment/PurchasePayment, only within each table.
+  async findOne(id: number, source: string) {
+    if (source === 'SALES_INVOICE') {
+      const payment = await this.prisma.payment.findUnique({
+        where: { id },
+        include: { invoice: { include: { salesOrder: true } }, journal: true },
+      });
+      if (!payment) throw new NotFoundException(`Payment ${id} not found`);
+      return {
+        id: payment.id,
+        source: 'SALES_INVOICE' as const,
+        paymentNumber: `INV-PAY-${String(payment.id).padStart(6, '0')}`,
+        partyType: 'CUSTOMER' as const,
+        partyName: payment.invoice.salesOrder?.clientName || 'Walk-in',
+        amount: payment.amount,
+        method: payment.method,
+        createdAt: payment.receivedAt,
+        journalName: payment.journal?.name || null,
+        notes: null,
+        allocations: [{
+          sourceType: 'SALES_INVOICE',
+          sourceId: payment.invoiceId,
+          documentNumber: payment.invoice.invoiceNumber,
+          amountAllocated: payment.amount,
+        }],
+      };
+    }
+
+    if (source === 'PURCHASE_BILL') {
+      const payment = await this.prisma.purchasePayment.findUnique({
+        where: { id },
+        include: { bill: { include: { purchaseOrder: { include: { supplier: true } } } }, journal: true },
+      });
+      if (!payment) throw new NotFoundException(`Payment ${id} not found`);
+      return {
+        id: payment.id,
+        source: 'PURCHASE_BILL' as const,
+        paymentNumber: `BILL-PAY-${String(payment.id).padStart(6, '0')}`,
+        partyType: 'SUPPLIER' as const,
+        partyName: payment.bill.purchaseOrder.supplier.name,
+        amount: payment.amount,
+        method: payment.method,
+        createdAt: payment.paidAt,
+        journalName: payment.journal?.name || null,
+        notes: null,
+        allocations: [{
+          sourceType: 'PURCHASE_BILL',
+          sourceId: payment.billId,
+          documentNumber: payment.bill.billNumber,
+          amountAllocated: payment.amount,
+        }],
+      };
+    }
+
+    const payment = await this.prisma.partyPayment.findUnique({
+      where: { id },
+      include: { allocations: true, journal: true },
+    });
     if (!payment) throw new NotFoundException(`Payment ${id} not found`);
-    return payment;
+
+    const allocations = await Promise.all(
+      payment.allocations.map(async (a) => {
+        const documentNumber = a.sourceType === 'SALES_INVOICE'
+          ? (await this.prisma.invoice.findUnique({ where: { id: a.sourceId } }))?.invoiceNumber
+          : (await this.prisma.bill.findUnique({ where: { id: a.sourceId } }))?.billNumber;
+        return { sourceType: a.sourceType, sourceId: a.sourceId, documentNumber: documentNumber || null, amountAllocated: a.amountAllocated };
+      }),
+    );
+
+    return {
+      id: payment.id,
+      source: 'PARTY' as const,
+      paymentNumber: payment.paymentNumber,
+      partyType: payment.partyType,
+      partyName: payment.partyName,
+      amount: payment.amount,
+      method: payment.method,
+      createdAt: payment.createdAt,
+      journalName: payment.journal?.name || null,
+      notes: payment.notes,
+      allocations,
+    };
   }
 
   // Atomic: payment row + allocations + amountPaid/status bump on each source doc + the
@@ -148,8 +228,8 @@ export class PartyPaymentsService {
 
       if (dto.partyType === 'CUSTOMER') {
         const [cashAccountId, arAccountId] = await Promise.all([
-          this.journalService.resolveJournalAccount(tx, dto.journalId, 'debit', '1000'),
-          this.journalService.getAccountIdByCode(tx, '1100'),
+          this.journalService.resolveJournalAccount(tx, dto.journalId, 'debit', AccountMappingRole.CASH_BANK),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE),
         ]);
         await this.journalService.postEntry(tx, {
           sourceType: 'PARTY_PAYMENT',
@@ -163,8 +243,8 @@ export class PartyPaymentsService {
         });
       } else {
         const [apAccountId, cashAccountId] = await Promise.all([
-          this.journalService.getAccountIdByCode(tx, '2000'),
-          this.journalService.resolveJournalAccount(tx, dto.journalId, 'credit', '1000'),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_PAYABLE),
+          this.journalService.resolveJournalAccount(tx, dto.journalId, 'credit', AccountMappingRole.CASH_BANK),
         ]);
         await this.journalService.postEntry(tx, {
           sourceType: 'PARTY_PAYMENT',

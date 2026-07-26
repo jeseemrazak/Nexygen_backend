@@ -1,11 +1,13 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateAccountDto } from './dto/create-account.dto';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
-// Essential Chart of Accounts for a Qatar-based distribution business. Existing codes
-// (1000/1100/1200/2000/2100/4000/5000) are load-bearing — hardcoded via getAccountIdByCode()
-// in invoices/party-payments/purchase-orders/expenses services — never rename or renumber them.
+// Essential Chart of Accounts for a Qatar-based distribution business. Every auto-posting call
+// site resolves its destination account through an AccountMapping role (admin-editable under
+// Settings → Account Mappings) rather than a hardcoded code — DEFAULT_ROLE_ACCOUNTS below is just
+// the starting-point mapping seedDefaults() creates, not a hardcoded posting destination itself.
 const DEFAULT_ACCOUNTS: { code: string; name: string; type: 'ASSET' | 'LIABILITY' | 'EQUITY' | 'INCOME' | 'EXPENSE'; subtype?: string }[] = [
   { code: '1000', name: 'Cash/Bank', type: 'ASSET', subtype: 'Current Asset' },
   { code: '1010', name: 'Bank', type: 'ASSET', subtype: 'Current Asset' },
@@ -31,6 +33,27 @@ const DEFAULT_ACCOUNTS: { code: string; name: string; type: 'ASSET' | 'LIABILITY
   { code: '5300', name: 'Commission Expense', type: 'EXPENSE', subtype: 'Operating Expense' },
   { code: '5900', name: 'General Expenses', type: 'EXPENSE', subtype: 'Operating Expense' },
 ];
+
+// Starting-point account for each posting role — only used to populate AccountMapping rows the
+// first time seedDefaults() runs (upsert never overwrites a mapping an admin already changed).
+const DEFAULT_ROLE_ACCOUNTS: Record<AccountMappingRole, string> = {
+  CASH_BANK: '1000',
+  ACCOUNTS_RECEIVABLE: '1100',
+  ACCOUNTS_PAYABLE: '2000',
+  INVENTORY: '1200',
+  STOCK_INTERIM: '2050',
+  COGS: '5000',
+  INVENTORY_ADJUSTMENT: '5100',
+  SALES_REVENUE: '4000',
+  EXPENSES_PAYABLE: '2100',
+  SALARY_EXPENSE: '5200',
+  GRSIA_EMPLOYER_EXPENSE: '5210',
+  GRSIA_PAYABLE: '2210',
+  EMPLOYEE_ADVANCES_RECEIVABLE: '1300',
+  SALARY_PAYABLE: '2200',
+  EOS_GRATUITY_EXPENSE: '5220',
+  EOS_GRATUITY_ACCRUAL: '2220',
+};
 
 @Injectable()
 export class AccountsService {
@@ -94,6 +117,8 @@ export class AccountsService {
 
   // Idempotent — safe to call more than once. Creates the minimum Chart of Accounts
   // needed for auto-posting from Sales/Purchase activity; more accounts can be added freely.
+  // Also seeds each AccountMapping role to its default account, but only if that role has no
+  // mapping row yet — never overwrites a remap an admin already made from Settings.
   async seedDefaults() {
     for (const account of DEFAULT_ACCOUNTS) {
       await this.prisma.account.upsert({
@@ -102,6 +127,15 @@ export class AccountsService {
         create: { ...account, isSystemAccount: true },
       });
     }
+
+    for (const role of Object.keys(DEFAULT_ROLE_ACCOUNTS) as AccountMappingRole[]) {
+      const existing = await this.prisma.accountMapping.findUnique({ where: { role } });
+      if (existing) continue;
+      const account = await this.prisma.account.findUnique({ where: { code: DEFAULT_ROLE_ACCOUNTS[role] } });
+      if (!account) continue;
+      await this.prisma.accountMapping.create({ data: { role, accountId: account.id } });
+    }
+
     return this.findAll();
   }
 

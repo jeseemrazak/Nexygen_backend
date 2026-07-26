@@ -2,11 +2,13 @@ import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
 import { InvoicesService } from './invoices.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { RecordPaymentDto } from './dto/record-payment.dto';
+import { Roles } from '../auth/roles.decorator';
 
 @Controller('invoices')
 export class InvoicesController {
   constructor(private readonly service: InvoicesService) {}
 
+  @Roles('ADMIN')
   @Post()
   create(@Body() dto: CreateInvoiceDto) {
     return this.service.create(dto);
@@ -22,6 +24,7 @@ export class InvoicesController {
     return this.service.findOne(+id);
   }
 
+  @Roles('ADMIN')
   @Post(':id/payments')
   recordPayment(@Param('id') id: string, @Body() dto: RecordPaymentDto) {
     return this.service.recordPayment(+id, dto);

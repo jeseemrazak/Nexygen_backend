@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { JournalService } from '../accounting/journal.service';
 
 @Injectable()
@@ -21,11 +22,11 @@ export class PayrollPostingService {
     const salaryPayableTotal = payslips.reduce((s, p) => s + p.netPay, 0);
 
     const [salaryExpenseId, grsiaExpenseId, grsiaPayableId, advancesId, salaryPayableId] = await Promise.all([
-      this.journalService.getAccountIdByCode(tx, '5200'),
-      this.journalService.getAccountIdByCode(tx, '5210'),
-      this.journalService.getAccountIdByCode(tx, '2210'),
-      this.journalService.getAccountIdByCode(tx, '1300'),
-      this.journalService.getAccountIdByCode(tx, '2200'),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.SALARY_EXPENSE),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.GRSIA_EMPLOYER_EXPENSE),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.GRSIA_PAYABLE),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.EMPLOYEE_ADVANCES_RECEIVABLE),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.SALARY_PAYABLE),
     ]);
 
     const lines: { accountId: number; debit?: number; credit?: number }[] = [
@@ -48,8 +49,8 @@ export class PayrollPostingService {
   // Dr Salary Payable / Cr the chosen Cash-or-Bank journal.
   async postPayrollDisbursement(tx: any, runId: number, amount: number, journalId?: number) {
     const [salaryPayableId, cashAccountId] = await Promise.all([
-      this.journalService.getAccountIdByCode(tx, '2200'),
-      this.journalService.resolveJournalAccount(tx, journalId, 'credit', '1000'),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.SALARY_PAYABLE),
+      this.journalService.resolveJournalAccount(tx, journalId, 'credit', AccountMappingRole.CASH_BANK),
     ]);
     return this.journalService.postEntry(tx, {
       sourceType: 'PAYROLL_DISBURSEMENT',
@@ -66,8 +67,8 @@ export class PayrollPostingService {
   // Dr Employee Advances Receivable / Cr the chosen Cash-or-Bank journal.
   async postLoanIssuance(tx: any, loanId: number, amount: number, journalId?: number) {
     const [advancesId, cashAccountId] = await Promise.all([
-      this.journalService.getAccountIdByCode(tx, '1300'),
-      this.journalService.resolveJournalAccount(tx, journalId, 'credit', '1000'),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.EMPLOYEE_ADVANCES_RECEIVABLE),
+      this.journalService.resolveJournalAccount(tx, journalId, 'credit', AccountMappingRole.CASH_BANK),
     ]);
     return this.journalService.postEntry(tx, {
       sourceType: 'LOAN_ISSUANCE',
@@ -84,8 +85,8 @@ export class PayrollPostingService {
   // Manual repayment outside payroll — Dr chosen Cash-or-Bank journal / Cr Employee Advances Receivable.
   async postLoanRepayment(tx: any, loanId: number, amount: number, journalId?: number) {
     const [cashAccountId, advancesId] = await Promise.all([
-      this.journalService.resolveJournalAccount(tx, journalId, 'debit', '1000'),
-      this.journalService.getAccountIdByCode(tx, '1300'),
+      this.journalService.resolveJournalAccount(tx, journalId, 'debit', AccountMappingRole.CASH_BANK),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.EMPLOYEE_ADVANCES_RECEIVABLE),
     ]);
     return this.journalService.postEntry(tx, {
       sourceType: 'LOAN_ISSUANCE',
@@ -104,8 +105,8 @@ export class PayrollPostingService {
   async postEosAccrual(tx: any, totalAmount: number) {
     const payrollJournal = await tx.journal.findUnique({ where: { code: 'PAYROLL' } });
     const [expenseId, accrualId] = await Promise.all([
-      this.journalService.getAccountIdByCode(tx, '5220'),
-      this.journalService.getAccountIdByCode(tx, '2220'),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.EOS_GRATUITY_EXPENSE),
+      this.journalService.getMappedAccountId(tx, AccountMappingRole.EOS_GRATUITY_ACCRUAL),
     ]);
     return this.journalService.postEntry(tx, {
       sourceType: 'EOS_ACCRUAL',

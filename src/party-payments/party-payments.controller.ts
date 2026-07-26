@@ -14,8 +14,8 @@ export class PartyPaymentsController {
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.service.findOne(+id);
+  findOne(@Param('id') id: string, @Query('source') source: string) {
+    return this.service.findOne(+id, source);
   }
 
   @Post()

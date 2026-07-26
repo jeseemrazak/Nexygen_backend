@@ -1,5 +1,6 @@
-import { Controller, Post, Get, Body } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Body, Param } from '@nestjs/common';
 import { UsersService } from './users.service';
+import { UpdateMerchandiserDto } from './dto/update-merchandiser.dto';
 import { Roles } from '../auth/roles.decorator';
 
 @Controller('users')
@@ -18,5 +19,12 @@ export class UsersController {
   @Get('merchandisers')
   getMerchandisers() {
     return this.usersService.getMerchandisers();
+  }
+
+  // 🔥 ROUTE: PATCH /users/merchandiser/:id — edit details and/or reset password
+  @Roles('ADMIN')
+  @Patch('merchandiser/:id')
+  updateMerchandiser(@Param('id') id: string, @Body() dto: UpdateMerchandiserDto) {
+    return this.usersService.updateMerchandiser(Number(id), dto);
   }
 }

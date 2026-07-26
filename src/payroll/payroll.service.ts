@@ -100,16 +100,18 @@ export class PayrollService {
   }
 
   async remove(id: number) {
-    const run = await this.prisma.payrollRun.findUnique({ where: { id } });
-    if (!run) throw new NotFoundException(`Payroll run ${id} not found`);
-    if (run.status !== 'DRAFT') throw new BadRequestException('Only a Draft run can be deleted');
-    return this.prisma.payrollRun.delete({ where: { id } });
+    const claim = await this.prisma.payrollRun.deleteMany({ where: { id, status: 'DRAFT' } });
+    if (claim.count === 0) {
+      const run = await this.prisma.payrollRun.findUnique({ where: { id } });
+      if (!run) throw new NotFoundException(`Payroll run ${id} not found`);
+      throw new BadRequestException('Only a Draft run can be deleted');
+    }
+    return { id };
   }
 
   async updatePayslipInputs(payslipId: number, dto: UpdatePayslipInputsDto) {
     const payslip = await this.prisma.payslip.findUnique({ where: { id: payslipId }, include: { payrollRun: true, employee: true } });
     if (!payslip) throw new NotFoundException(`Payslip ${payslipId} not found`);
-    if (payslip.payrollRun.status !== 'DRAFT') throw new BadRequestException('Can only edit a payslip while its run is still Draft');
 
     const config = await this.configService.get();
     const result = this.calc.calculatePayslip(
@@ -129,8 +131,10 @@ export class PayrollService {
       config,
     );
 
-    const updated = await this.prisma.payslip.update({
-      where: { id: payslipId },
+    // Guard via the payslip's own run status at write time, not the read above — a concurrent
+    // process() could flip the run out of Draft between the read and this write otherwise.
+    const claim = await this.prisma.payslip.updateMany({
+      where: { id: payslipId, payrollRun: { status: 'DRAFT' } },
       data: {
         overtimeHours: dto.overtimeHours ?? payslip.overtimeHours,
         nightOvertimeHours: dto.nightOvertimeHours ?? payslip.nightOvertimeHours,
@@ -144,17 +148,19 @@ export class PayrollService {
         netPay: result.netPay,
       },
     });
+    if (claim.count === 0) throw new BadRequestException('Can only edit a payslip while its run is still Draft');
 
     await this.recomputeRunTotals(payslip.payrollRunId);
-    return updated;
+    return this.prisma.payslip.findUnique({ where: { id: payslipId } });
   }
 
   async removePayslip(payslipId: number) {
     const payslip = await this.prisma.payslip.findUnique({ where: { id: payslipId }, include: { payrollRun: true } });
     if (!payslip) throw new NotFoundException(`Payslip ${payslipId} not found`);
-    if (payslip.payrollRun.status !== 'DRAFT') throw new BadRequestException('Can only remove a payslip while its run is still Draft');
 
-    await this.prisma.payslip.delete({ where: { id: payslipId } });
+    const claim = await this.prisma.payslip.deleteMany({ where: { id: payslipId, payrollRun: { status: 'DRAFT' } } });
+    if (claim.count === 0) throw new BadRequestException('Can only remove a payslip while its run is still Draft');
+
     await this.recomputeRunTotals(payslip.payrollRunId);
     return { removed: true };
   }
@@ -172,9 +178,13 @@ export class PayrollService {
   async process(id: number) {
     const run = await this.prisma.payrollRun.findUnique({ where: { id }, include: { payslips: { include: { employee: { include: { loans: true } } } } } });
     if (!run) throw new NotFoundException(`Payroll run ${id} not found`);
-    if (run.status !== 'DRAFT') throw new BadRequestException(`Run ${id} is not a draft (status: ${run.status})`);
 
     return this.prisma.$transaction(async (tx) => {
+      // Claim the transition up front — the WHERE clause, not the read above, is what stops
+      // two concurrent process() calls from both applying loan deductions and posting GL twice.
+      const claim = await tx.payrollRun.updateMany({ where: { id, status: 'DRAFT' }, data: { status: 'PROCESSED' } });
+      if (claim.count === 0) throw new BadRequestException(`Run ${id} is not a draft (status: ${run.status})`);
+
       let totalGross = 0;
       let totalDeductions = 0;
       let totalNet = 0;
@@ -216,7 +226,7 @@ export class PayrollService {
 
       return tx.payrollRun.update({
         where: { id },
-        data: { status: 'PROCESSED', totalGross, totalDeductions, totalNet, journalEntryId: entry.id },
+        data: { totalGross, totalDeductions, totalNet, journalEntryId: entry.id },
         include: RUN_INCLUDE,
       });
     }, { timeout: 15000 });
@@ -226,13 +236,15 @@ export class PayrollService {
   async markPaid(id: number, dto: MarkPaidDto) {
     const run = await this.prisma.payrollRun.findUnique({ where: { id } });
     if (!run) throw new NotFoundException(`Payroll run ${id} not found`);
-    if (run.status !== 'PROCESSED') throw new BadRequestException(`Run ${id} must be Processed before it can be marked Paid (status: ${run.status})`);
 
     return this.prisma.$transaction(async (tx) => {
+      const claim = await tx.payrollRun.updateMany({ where: { id, status: 'PROCESSED' }, data: { status: 'PAID' } });
+      if (claim.count === 0) throw new BadRequestException(`Run ${id} must be Processed before it can be marked Paid (status: ${run.status})`);
+
       const entry = await this.posting.postPayrollDisbursement(tx, id, run.totalNet, dto.journalId);
       return tx.payrollRun.update({
         where: { id },
-        data: { status: 'PAID', paymentJournalEntryId: entry.id },
+        data: { paymentJournalEntryId: entry.id },
         include: RUN_INCLUDE,
       });
     });

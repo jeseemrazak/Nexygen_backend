@@ -2,7 +2,9 @@ import { Controller, Get, Post, Patch, Delete, Body, Param, Query } from '@nestj
 import { PaymentMethodsService } from './payment-methods.service';
 import { CreatePaymentMethodDto } from './dto/create-payment-method.dto';
 import { UpdatePaymentMethodDto } from './dto/update-payment-method.dto';
+import { Roles } from '../auth/roles.decorator';
 
+@Roles('ADMIN')
 @Controller('accounting/payment-methods')
 export class PaymentMethodsController {
   constructor(private readonly paymentMethodsService: PaymentMethodsService) {}

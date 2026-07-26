@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
@@ -62,16 +63,22 @@ export class InvoicesService {
             price: soItem.price,
           },
         });
-        await tx.salesOrderItem.update({
-          where: { id: soItem.id },
+        // Guard is the WHERE clause (current DB value vs. a precomputed threshold), not the
+        // pre-transaction `remaining` check above — two concurrent invoices against the same
+        // order item can't both pass that check and jointly over-invoice past the ordered quantity.
+        const claimed = await tx.salesOrderItem.updateMany({
+          where: { id: soItem.id, quantityInvoiced: { lte: soItem.quantity - reqItem.quantity } },
           data: { quantityInvoiced: { increment: reqItem.quantity } },
         });
+        if (claimed.count === 0) {
+          throw new BadRequestException(`Cannot invoice ${reqItem.quantity} for item ${soItem.id}; exceeds ordered quantity`);
+        }
       }
 
       if (totalAmount > 0) {
         const [arAccountId, revenueAccountId] = await Promise.all([
-          this.journalService.getAccountIdByCode(tx, '1100'),
-          this.journalService.getAccountIdByCode(tx, '4000'),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.SALES_REVENUE),
         ]);
         await this.journalService.postEntry(tx, {
           sourceType: 'SALES_INVOICE',
@@ -107,11 +114,19 @@ export class InvoicesService {
       const invoice = await tx.invoice.findUnique({ where: { id: invoiceId }, include: { salesOrder: true } });
       if (!invoice) throw new NotFoundException(`Invoice ${invoiceId} not found`);
 
+      const { _sum: existingSum } = await tx.payment.aggregate({ where: { invoiceId }, _sum: { amount: true } });
+      const currentPaid = existingSum.amount || 0;
+      if (currentPaid + dto.amount > invoice.totalAmount + 0.01) {
+        throw new BadRequestException(
+          `Payment of ${dto.amount} would exceed the outstanding balance of ${(invoice.totalAmount - currentPaid).toFixed(2)}`,
+        );
+      }
+
       await tx.payment.create({ data: { invoiceId, amount: dto.amount, method: dto.method, journalId: dto.journalId } });
 
       const [cashAccountId, arAccountId] = await Promise.all([
-        this.journalService.resolveJournalAccount(tx, dto.journalId, 'debit', '1000'),
-        this.journalService.getAccountIdByCode(tx, '1100'),
+        this.journalService.resolveJournalAccount(tx, dto.journalId, 'debit', AccountMappingRole.CASH_BANK),
+        this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE),
       ]);
       await this.journalService.postEntry(tx, {
         sourceType: 'SALES_PAYMENT',

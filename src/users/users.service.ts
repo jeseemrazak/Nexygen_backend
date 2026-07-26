@@ -1,4 +1,4 @@
-import { Injectable, ConflictException } from '@nestjs/common';
+import { Injectable, ConflictException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import * as bcrypt from 'bcryptjs';
 
@@ -38,6 +38,30 @@ export class UsersService {
       where: { role: 'MERCHANDISER' },
       select: { id: true, name: true, email: true, createdAt: true },
       orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  // 🔥 3. Edit a merchandiser's details, and/or reset their password — password is only
+  // rehashed when the admin actually supplied a new one, same "optional credential in the
+  // profile-update DTO" pattern as PosStaffService.update().
+  async updateMerchandiser(id: number, data: { name?: string; email?: string; password?: string }) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user || user.role !== 'MERCHANDISER') {
+      throw new NotFoundException(`Merchandiser ${id} not found`);
+    }
+
+    if (data.email && data.email !== user.email) {
+      const existing = await this.prisma.user.findUnique({ where: { email: data.email } });
+      if (existing) throw new ConflictException('A user with this email already exists.');
+    }
+
+    const updateData: any = { name: data.name, email: data.email };
+    if (data.password) updateData.password = await bcrypt.hash(data.password, 10);
+
+    return this.prisma.user.update({
+      where: { id },
+      data: updateData,
+      select: { id: true, name: true, email: true, role: true, createdAt: true },
     });
   }
 }

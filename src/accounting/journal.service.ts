@@ -1,4 +1,5 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateJournalEntryDto } from './dto/create-journal-entry.dto';
 
@@ -6,8 +7,10 @@ import { CreateJournalEntryDto } from './dto/create-journal-entry.dto';
 export class JournalService {
   constructor(private prisma: PrismaService) {}
 
-  // Resolves a well-known Chart of Accounts code (e.g. '1100') to its id — used by the
-  // auto-posting call sites in OrdersService/PurchaseOrdersService, which only know codes.
+  // Resolves a well-known Chart of Accounts code (e.g. '1100') to its id — used only by seed
+  // scripts and the few reporting spots that read a fixed system account directly, never by
+  // auto-posting call sites (those resolve through getMappedAccountId so the destination is
+  // admin-configurable from Settings → Account Mappings instead of hardcoded).
   async getAccountIdByCode(tx: any, code: string): Promise<number> {
     const account = await tx.account.findUnique({ where: { code } });
     if (!account) {
@@ -18,17 +21,38 @@ export class JournalService {
     return account.id;
   }
 
+  // Resolves which GL account an auto-posting site should hit for a given role, honoring
+  // whatever an admin has mapped under Settings → Account Mappings. tx-scoped so it can be
+  // called from inside the same $transaction as the posting it accompanies.
+  async getMappedAccountId(tx: any, role: AccountMappingRole): Promise<number> {
+    const mapping = await tx.accountMapping.findUnique({ where: { role } });
+    if (!mapping) {
+      throw new BadRequestException(`No account is mapped for ${role} — configure it under Settings → Account Mappings.`);
+    }
+    return mapping.accountId;
+  }
+
+  // Same as getMappedAccountId but returns the full Account row (for reporting call sites that
+  // need the code/name, not just the id, and aren't running inside a posting transaction).
+  async getMappedAccount(role: AccountMappingRole) {
+    const mapping = await this.prisma.accountMapping.findUnique({ where: { role }, include: { account: true } });
+    if (!mapping) {
+      throw new BadRequestException(`No account is mapped for ${role} — configure it under Settings → Account Mappings.`);
+    }
+    return mapping.account;
+  }
+
   // Resolves which GL account a payment's cash/bank leg should hit. If the caller picked a
-  // journal, use its default account for that side; otherwise fall back to the hardcoded
-  // account code (preserves exact pre-journal behavior for callers that don't pass a journalId).
-  async resolveJournalAccount(tx: any, journalId: number | undefined | null, side: 'debit' | 'credit', fallbackCode: string): Promise<number> {
+  // journal, use its default account for that side; otherwise fall back to the CASH_BANK
+  // mapping (preserves exact pre-journal behavior for callers that don't pass a journalId).
+  async resolveJournalAccount(tx: any, journalId: number | undefined | null, side: 'debit' | 'credit', fallbackRole: AccountMappingRole = AccountMappingRole.CASH_BANK): Promise<number> {
     if (journalId) {
       const journal = await tx.journal.findUnique({ where: { id: journalId } });
       if (!journal) throw new BadRequestException(`Journal ${journalId} not found`);
       const accountId = side === 'debit' ? journal.defaultDebitAccountId : journal.defaultCreditAccountId;
       if (accountId) return accountId;
     }
-    return this.getAccountIdByCode(tx, fallbackCode);
+    return this.getMappedAccountId(tx, fallbackRole);
   }
 
   // Core double-entry posting primitive. Callable inside an existing $transaction (pass
@@ -48,10 +72,12 @@ export class JournalService {
         | 'EXPENSE_PAYMENT'
         | 'POS_SALE'
         | 'POS_SALE_COGS'
+        | 'SALES_DELIVERY_COGS'
         | 'PAYROLL_RUN'
         | 'PAYROLL_DISBURSEMENT'
         | 'LOAN_ISSUANCE'
-        | 'EOS_ACCRUAL';
+        | 'EOS_ACCRUAL'
+        | 'STOCK_ADJUSTMENT';
       sourceId?: number;
       memo?: string;
       date?: Date;
@@ -137,7 +163,15 @@ export class JournalService {
   // Posted entries are never edited or deleted — a "void" creates an offsetting reversal entry
   // (every line's debit/credit swapped) and marks the original voidedAt, preserving full audit trail.
   async voidEntry(id: number, reason?: string) {
-    const original = await this.prisma.journalEntry.findUnique({
+    return this.prisma.$transaction(async (tx) => this.voidEntryInTx(tx, id, reason));
+  }
+
+  // Same as voidEntry, but runs against a caller-supplied tx client so it can be composed into
+  // a larger atomic operation (e.g. POS sale cancellation, which must restock inventory and
+  // reverse the GL in one transaction — two separate transactions would leave a window where a
+  // crash mid-sequence strands the ledger with no retry path, since the first step is one-shot).
+  async voidEntryInTx(tx: any, id: number, reason?: string) {
+    const original = await tx.journalEntry.findUnique({
       where: { id },
       include: { lines: true, reversedBy: true },
     });
@@ -149,40 +183,35 @@ export class JournalService {
       throw new BadRequestException(`Entry ${id} is itself a reversal entry and cannot be voided`);
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      const reversal = await tx.journalEntry.create({
-        data: {
-          sourceType: original.sourceType,
-          sourceId: original.sourceId,
-          memo: reason ? `Void: ${reason} (reversal of entry #${original.id})` : `Reversal of entry #${original.id}`,
-          date: new Date(),
-          reversalOfId: original.id,
-          lines: {
-            create: original.lines.map((l) => ({
-              accountId: l.accountId,
-              debit: l.credit,
-              credit: l.debit,
-              description: l.description,
-            })),
-          },
+    const reversal = await tx.journalEntry.create({
+      data: {
+        sourceType: original.sourceType,
+        sourceId: original.sourceId,
+        memo: reason ? `Void: ${reason} (reversal of entry #${original.id})` : `Reversal of entry #${original.id}`,
+        date: new Date(),
+        reversalOfId: original.id,
+        lines: {
+          create: original.lines.map((l: any) => ({
+            accountId: l.accountId,
+            debit: l.credit,
+            credit: l.debit,
+            description: l.description,
+          })),
         },
-        include: { lines: { include: { account: true } } },
-      });
-
-      await tx.journalEntry.update({ where: { id: original.id }, data: { voidedAt: new Date() } });
-
-      return reversal;
+      },
+      include: { lines: { include: { account: true } } },
     });
+
+    await tx.journalEntry.update({ where: { id: original.id }, data: { voidedAt: new Date() } });
+
+    return reversal;
   }
 
   // A single customer's or supplier's slice of the AR/AP account — every posted line where
   // that party's name was tagged (invoices, payments), chronological with a running balance.
   async getPartnerLedger(partyType: 'CUSTOMER' | 'SUPPLIER', partyName: string) {
-    const accountCode = partyType === 'CUSTOMER' ? '1100' : '2000';
-    const account = await this.prisma.account.findUnique({ where: { code: accountCode } });
-    if (!account) {
-      throw new BadRequestException(`Chart of Accounts is missing account ${accountCode} — run POST /accounting/accounts/seed-defaults first.`);
-    }
+    const role = partyType === 'CUSTOMER' ? AccountMappingRole.ACCOUNTS_RECEIVABLE : AccountMappingRole.ACCOUNTS_PAYABLE;
+    const account = await this.getMappedAccount(role);
 
     const lines = await this.prisma.journalLine.findMany({
       where: { accountId: account.id, partyType, partyName },
@@ -313,7 +342,7 @@ export class JournalService {
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const sixtyDaysAgo = new Date(now.getTime() - 60 * 86400000);
 
-    const [balanceSheet, mtdPL, journals] = await Promise.all([
+    const [balanceSheet, mtdPL, journals, mappedAccounts] = await Promise.all([
       this.getBalanceSheet(),
       this.getProfitAndLoss(monthStart.toISOString()),
       this.prisma.journal.findMany({
@@ -321,23 +350,43 @@ export class JournalService {
         include: { defaultDebitAccount: true, defaultCreditAccount: true },
         orderBy: { code: 'asc' },
       }),
+      this.prisma.accountMapping.findMany({
+        where: {
+          role: {
+            in: [
+              AccountMappingRole.ACCOUNTS_RECEIVABLE,
+              AccountMappingRole.ACCOUNTS_PAYABLE,
+              AccountMappingRole.CASH_BANK,
+              AccountMappingRole.SALARY_PAYABLE,
+              AccountMappingRole.GRSIA_PAYABLE,
+              AccountMappingRole.EOS_GRATUITY_ACCRUAL,
+              AccountMappingRole.EMPLOYEE_ADVANCES_RECEIVABLE,
+            ],
+          },
+        },
+        include: { account: true },
+      }),
     ]);
 
     const balanceLines = [...balanceSheet.assetLines, ...balanceSheet.liabilityLines];
     const amountByCode = (code: string) => balanceLines.find((l) => l.account.code === code)?.amount || 0;
+    const accountIdFor = (role: AccountMappingRole) => mappedAccounts.find((m) => m.role === role)?.accountId;
+    const amountByRole = (role: AccountMappingRole) => balanceLines.find((l) => l.account.id === accountIdFor(role))?.amount || 0;
 
     const kpis = {
-      receivables: amountByCode('1100'),
-      payables: amountByCode('2000'),
-      cashAndBank: amountByCode('1000') + amountByCode('1010'),
+      receivables: amountByRole(AccountMappingRole.ACCOUNTS_RECEIVABLE),
+      payables: amountByRole(AccountMappingRole.ACCOUNTS_PAYABLE),
+      // '1010' Bank is a fixed system account (not itself a mapped role — only reachable via an
+      // explicit Journal override) summed alongside whatever the CASH_BANK role currently resolves to.
+      cashAndBank: amountByRole(AccountMappingRole.CASH_BANK) + amountByCode('1010'),
       mtdNetIncome: mtdPL.netProfit,
     };
 
     const payroll = {
-      salaryPayable: amountByCode('2200'),
-      grsiaPayable: amountByCode('2210'),
-      eosGratuityAccrual: amountByCode('2220'),
-      employeeAdvances: amountByCode('1300'),
+      salaryPayable: amountByRole(AccountMappingRole.SALARY_PAYABLE),
+      grsiaPayable: amountByRole(AccountMappingRole.GRSIA_PAYABLE),
+      eosGratuityAccrual: amountByRole(AccountMappingRole.EOS_GRATUITY_ACCRUAL),
+      employeeAdvances: amountByRole(AccountMappingRole.EMPLOYEE_ADVANCES_RECEIVABLE),
     };
 
     const [

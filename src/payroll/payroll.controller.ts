@@ -3,7 +3,9 @@ import { PayrollService } from './payroll.service';
 import { GenerateRunDto } from './dto/generate-run.dto';
 import { UpdatePayslipInputsDto } from './dto/update-payslip-inputs.dto';
 import { MarkPaidDto } from './dto/mark-paid.dto';
+import { Roles } from '../auth/roles.decorator';
 
+@Roles('ADMIN')
 @Controller('payroll')
 export class PayrollController {
   constructor(private readonly service: PayrollService) {}

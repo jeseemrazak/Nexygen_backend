@@ -2,7 +2,9 @@ import { Controller, Get, Post, Patch, Delete, Body, Param, Query } from '@nestj
 import { EmployeesService } from './employees.service';
 import { CreateEmployeeDto } from './dto/create-employee.dto';
 import { UpdateEmployeeDto } from './dto/update-employee.dto';
+import { Roles } from '../auth/roles.decorator';
 
+@Roles('ADMIN')
 @Controller('employees')
 export class EmployeesController {
   constructor(private readonly service: EmployeesService) {}

@@ -2,7 +2,9 @@ import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
 import { EmployeeLoansService } from './employee-loans.service';
 import { IssueLoanDto } from './dto/issue-loan.dto';
 import { RepayLoanDto } from './dto/repay-loan.dto';
+import { Roles } from '../auth/roles.decorator';
 
+@Roles('ADMIN')
 @Controller('employee-loans')
 export class EmployeeLoansController {
   constructor(private readonly service: EmployeeLoansService) {}
