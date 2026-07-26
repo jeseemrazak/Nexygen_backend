@@ -2,6 +2,8 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateSalesOrderDto } from './dto/create-sales-order.dto';
 import { ConfirmSalesOrderDto } from './dto/confirm-sales-order.dto';
+import { applyDiscount, DiscountType } from '../common/discount.util';
+import { NotificationsService } from '../notifications/notifications.service';
 
 const DETAIL_INCLUDE = {
   items: { include: { product: true } },
@@ -14,13 +16,24 @@ const DETAIL_INCLUDE = {
 
 @Injectable()
 export class SalesOrdersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private notifications: NotificationsService,
+  ) {}
 
   // Every Sales Order starts life as a DRAFT — merchandiser assignment always happens via
   // confirm(), whether this order came from a converted Quotation or was created directly.
   // No stock, no batch, no invoice here — those belong to Delivery/Invoice respectively.
   async create(dto: CreateSalesOrderDto) {
-    const totalAmount = dto.items.reduce((sum, i) => sum + i.quantity * i.price, 0);
+    // Line discount is baked into the stored net `price` here — everything downstream (Invoice,
+    // Delivery COGS, GL) keeps reading `price` exactly as before, discounted or not.
+    const items = dto.items.map((i) => {
+      const listPrice = i.listPrice ?? i.price;
+      const price = applyDiscount(listPrice, i.lineDiscountType, i.lineDiscountValue);
+      return { ...i, listPrice: i.listPrice ?? null, price };
+    });
+    const subtotal = items.reduce((sum, i) => sum + i.quantity * i.price, 0);
+    const totalAmount = applyDiscount(subtotal, dto.discountType, dto.discountValue);
 
     let clientName = dto.clientName;
     if (dto.customerId) {
@@ -33,12 +46,20 @@ export class SalesOrdersService {
         warehouseId: dto.warehouseId,
         clientName,
         customerId: dto.customerId,
+        customerReference: dto.customerReference,
+        termsAndConditions: dto.termsAndConditions,
+        discountType: dto.discountType,
+        discountValue: dto.discountValue ?? 0,
+        subtotal,
         totalAmount,
         items: {
-          create: dto.items.map((i) => ({
+          create: items.map((i) => ({
             productId: i.productId,
             quantity: i.quantity,
             price: i.price,
+            listPrice: i.listPrice,
+            lineDiscountType: i.lineDiscountType,
+            lineDiscountValue: i.lineDiscountValue ?? 0,
           })),
         },
       },
@@ -47,18 +68,46 @@ export class SalesOrdersService {
   }
 
   // Used internally by QuotationsService.convert() — same shape, just named for that call site.
-  async createFromQuotation(dto: { warehouseId: number; clientName?: string; customerId?: number; items: { productId: number; quantity: number; price: number }[]; totalAmount: number }) {
+  // The Quotation already computed final net prices/subtotal/totalAmount, so this is a pure
+  // carry-forward, not a recomputation.
+  async createFromQuotation(dto: {
+    warehouseId: number;
+    clientName?: string;
+    customerId?: number;
+    customerReference?: string;
+    termsAndConditions?: string;
+    discountType?: DiscountType | null;
+    discountValue?: number;
+    subtotal: number;
+    totalAmount: number;
+    items: {
+      productId: number;
+      quantity: number;
+      price: number;
+      listPrice?: number | null;
+      lineDiscountType?: DiscountType | null;
+      lineDiscountValue?: number;
+    }[];
+  }) {
     return this.prisma.salesOrder.create({
       data: {
         warehouseId: dto.warehouseId,
         clientName: dto.clientName,
         customerId: dto.customerId,
+        customerReference: dto.customerReference,
+        termsAndConditions: dto.termsAndConditions,
+        discountType: dto.discountType,
+        discountValue: dto.discountValue ?? 0,
+        subtotal: dto.subtotal,
         totalAmount: dto.totalAmount,
         items: {
           create: dto.items.map((i) => ({
             productId: i.productId,
             quantity: i.quantity,
             price: i.price,
+            listPrice: i.listPrice,
+            lineDiscountType: i.lineDiscountType,
+            lineDiscountValue: i.lineDiscountValue ?? 0,
           })),
         },
       },
@@ -101,11 +150,13 @@ export class SalesOrdersService {
       throw new BadRequestException('Invalid user or not a merchandiser');
     }
 
-    return this.prisma.salesOrder.update({
+    const updated = await this.prisma.salesOrder.update({
       where: { id },
       data: { userId: dto.userId, status: 'CONFIRMED' },
       include: DETAIL_INCLUDE,
     });
+    this.notifications.notifyOrderConfirmed(updated).catch(() => {});
+    return updated;
   }
 
   // Only safe while nothing has been fulfilled/billed yet.

@@ -1,11 +1,12 @@
-import { IsString, IsOptional, IsInt } from 'class-validator';
+import { IsString, IsOptional } from 'class-validator';
 
 export class CancelPosSaleDto {
   @IsString()
   @IsOptional()
   reason?: string;
 
-  @IsInt()
+  // Verified via PosStaffService.resolveStaffToken — see create-pos-sale.dto.ts for why.
+  @IsString()
   @IsOptional()
-  cancelledById?: number;
+  cancelledByToken?: string;
 }

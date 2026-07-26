@@ -1,10 +1,16 @@
-import { IsInt, IsOptional } from 'class-validator';
+import { IsInt, IsString, IsNumber, IsOptional } from 'class-validator';
 
 export class OpenSessionDto {
   @IsInt()
   warehouseId: number;
 
-  @IsInt()
+  // Verified via PosStaffService.resolveStaffToken — see create-pos-sale.dto.ts for why.
+  @IsString()
   @IsOptional()
-  openedById?: number;
+  openedByToken?: string;
+
+  // Starting float in the cash drawer — optional, only meaningful for till reconciliation at close.
+  @IsNumber()
+  @IsOptional()
+  openingCash?: number;
 }

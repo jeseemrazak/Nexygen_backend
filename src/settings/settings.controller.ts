@@ -5,6 +5,7 @@ import { extname } from 'path';
 import { SettingsService } from './settings.service';
 import { UpdateCompanySettingsDto } from './dto/update-company-settings.dto';
 import { Roles } from '../auth/roles.decorator';
+import { assertValidImageFile } from '../common/file-validation';
 
 @Controller('settings/company')
 export class SettingsController {
@@ -33,8 +34,8 @@ export class SettingsController {
       },
     }),
     fileFilter: (req, file, cb) => {
-      if (!/^image\/(jpeg|png|webp|svg\+xml)$/.test(file.mimetype)) {
-        return cb(new BadRequestException('Only JPEG, PNG, WEBP, or SVG images are allowed'), false);
+      if (!/^image\/(jpeg|png|webp)$/.test(file.mimetype)) {
+        return cb(new BadRequestException('Only JPEG, PNG, or WEBP images are allowed'), false);
       }
       cb(null, true);
     },
@@ -42,6 +43,7 @@ export class SettingsController {
   }))
   uploadLogo(@UploadedFile() file?: Express.Multer.File) {
     if (!file) throw new BadRequestException('No file uploaded');
+    assertValidImageFile(file.path);
     return this.service.updateLogo(`/uploads/logos/${file.filename}`);
   }
 }

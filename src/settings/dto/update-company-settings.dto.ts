@@ -1,4 +1,4 @@
-import { IsString, IsOptional, IsBoolean, IsObject, IsIn } from 'class-validator';
+import { IsString, IsOptional, IsBoolean, IsObject, IsIn, IsInt, IsNumber } from 'class-validator';
 
 export class UpdateCompanySettingsDto {
   @IsString() @IsOptional() name?: string;
@@ -23,4 +23,12 @@ export class UpdateCompanySettingsDto {
   @IsIn(['compact', 'normal', 'spacious']) @IsOptional() reportDensity?: string;
   @IsIn(['bordered', 'striped', 'minimal']) @IsOptional() reportBorderStyle?: string;
   @IsObject() @IsOptional() reportFieldsJson?: Record<string, string[]>;
+
+  @IsInt() @IsOptional() posDefaultWarehouseId?: number;
+  @IsInt() @IsOptional() posDefaultPaymentMethodId?: number;
+  @IsBoolean() @IsOptional() posRequireCustomer?: boolean;
+  @IsString() @IsOptional() posReceiptFooter?: string;
+  @IsBoolean() @IsOptional() posAutoPrintReceipt?: boolean;
+  @IsNumber() @IsOptional() posMaxDiscountPercent?: number;
+  @IsBoolean() @IsOptional() posRequireCashCount?: boolean;
 }

@@ -7,9 +7,11 @@ import { PosSalesService } from './pos-sales.service';
 import { PosSalesController } from './pos-sales.controller';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountingModule } from '../accounting/accounting.module';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
 
 @Module({
-  imports: [AccountingModule],
+  imports: [AccountingModule, NotificationsModule, LoyaltyModule],
   controllers: [PosStaffController, PosSessionsController, PosSalesController],
   providers: [PosStaffService, PosSessionsService, PosSalesService, PrismaService],
 })

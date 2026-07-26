@@ -2,8 +2,10 @@ import { Module } from '@nestjs/common';
 import { SalesOrdersService } from './sales-orders.service';
 import { SalesOrdersController } from './sales-orders.controller';
 import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
+  imports: [NotificationsModule],
   controllers: [SalesOrdersController],
   providers: [SalesOrdersService, PrismaService],
   exports: [SalesOrdersService],

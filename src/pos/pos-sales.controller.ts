@@ -17,6 +17,15 @@ export class PosSalesController {
     return this.service.findAll(sessionId ? +sessionId : undefined);
   }
 
+  @Get('report')
+  getReport(
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('warehouseId') warehouseId?: string,
+  ) {
+    return this.service.getReport({ from, to, warehouseId: warehouseId ? +warehouseId : undefined });
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.service.findOne(+id);
@@ -24,6 +33,6 @@ export class PosSalesController {
 
   @Post(':id/cancel')
   cancel(@Param('id') id: string, @Body() dto: CancelPosSaleDto) {
-    return this.service.cancel(+id, dto.reason, dto.cancelledById);
+    return this.service.cancel(+id, dto.reason, dto.cancelledByToken);
   }
 }

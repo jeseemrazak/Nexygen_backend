@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { PosStaffService } from './pos-staff.service';
 import { OpenSessionDto } from './dto/open-session.dto';
 import { CloseSessionDto } from './dto/close-session.dto';
 
@@ -12,17 +13,22 @@ const DETAIL_INCLUDE = {
 
 @Injectable()
 export class PosSessionsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private posStaffService: PosStaffService,
+  ) {}
 
-  // Sessions are simple open/close time markers — no starting-cash or reconciliation fields,
-  // matching the reference: a session's sales are whatever falls inside its time window.
+  // A session's sales are whatever falls inside its open/close time window. Cash reconciliation
+  // is optional — openingCash/countedCash are only stored when the till was actually counted;
+  // expectedCash/cashVariance are always server-computed, never accepted from the client.
   async open(dto: OpenSessionDto) {
     const openSession = await this.prisma.posSession.findFirst({ where: { warehouseId: dto.warehouseId, status: 'OPEN' } });
     if (openSession) {
       throw new BadRequestException(`Warehouse ${dto.warehouseId} already has an open session (#${openSession.id})`);
     }
+    const openedById = await this.posStaffService.resolveStaffToken(dto.openedByToken);
     return this.prisma.posSession.create({
-      data: { warehouseId: dto.warehouseId, openedById: dto.openedById },
+      data: { warehouseId: dto.warehouseId, openedById, openingCash: dto.openingCash },
       include: DETAIL_INCLUDE,
     });
   }
@@ -32,9 +38,28 @@ export class PosSessionsService {
     if (!session) throw new NotFoundException(`Session ${id} not found`);
     if (session.status === 'CLOSED') throw new BadRequestException(`Session ${id} is already closed`);
 
+    const closedById = await this.posStaffService.resolveStaffToken(dto.closedByToken);
+
+    // Expected cash = opening float + this session's non-cancelled sales paid through a
+    // cash-type journal (card/bank payment methods don't touch the physical drawer).
+    const cashSales = await this.prisma.posSale.findMany({
+      where: { sessionId: id, cancelledAt: null, paymentMethod: { journal: { type: 'CASH' } } },
+      select: { totalAmount: true },
+    });
+    const cashSalesTotal = cashSales.reduce((sum, s) => sum + s.totalAmount, 0);
+    const expectedCash = (session.openingCash ?? 0) + cashSalesTotal;
+    const cashVariance = dto.countedCash != null ? dto.countedCash - expectedCash : null;
+
     return this.prisma.posSession.update({
       where: { id },
-      data: { status: 'CLOSED', closedAt: new Date(), closedById: dto.closedById },
+      data: {
+        status: 'CLOSED',
+        closedAt: new Date(),
+        closedById,
+        expectedCash,
+        countedCash: dto.countedCash ?? null,
+        cashVariance,
+      },
       include: DETAIL_INCLUDE,
     });
   }
