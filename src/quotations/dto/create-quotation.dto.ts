@@ -1,4 +1,4 @@
-import { IsInt, IsArray, ValidateNested, IsNumber, IsString, IsOptional, IsDateString, Min } from 'class-validator';
+import { IsInt, IsArray, ValidateNested, IsNumber, IsString, IsOptional, IsDateString, IsIn, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 class QuotationItemDto {
@@ -12,6 +12,21 @@ class QuotationItemDto {
   @IsNumber()
   @Min(0)
   price: number;
+
+  // Original unit price before the line discount below — omit if there's no discount on this line.
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  listPrice?: number;
+
+  @IsIn(['PERCENT', 'AMOUNT'])
+  @IsOptional()
+  lineDiscountType?: 'PERCENT' | 'AMOUNT';
+
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  lineDiscountValue?: number;
 }
 
 export class CreateQuotationDto {
@@ -33,6 +48,24 @@ export class CreateQuotationDto {
   @IsDateString()
   @IsOptional()
   validUntil?: string;
+
+  @IsString()
+  @IsOptional()
+  customerReference?: string;
+
+  @IsString()
+  @IsOptional()
+  termsAndConditions?: string;
+
+  // Global (whole-document) discount — applies to the subtotal after all line discounts.
+  @IsIn(['PERCENT', 'AMOUNT'])
+  @IsOptional()
+  discountType?: 'PERCENT' | 'AMOUNT';
+
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  discountValue?: number;
 
   @IsArray()
   @ValidateNested({ each: true })

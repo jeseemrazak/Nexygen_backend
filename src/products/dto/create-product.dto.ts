@@ -1,4 +1,4 @@
-import { IsString, IsNumber, IsNotEmpty, Min, IsOptional } from 'class-validator';
+import { IsString, IsNumber, IsNotEmpty, Min, IsOptional, IsInt, IsIn, IsBoolean } from 'class-validator';
 
 export class CreateProductDto {
   @IsString()
@@ -29,4 +29,25 @@ export class CreateProductDto {
   @IsString()
   @IsOptional()
   barcodeBox?: string;
+
+  // A Service skips warehouse/stock/batch requirements on the Sales side (Delivery, POS).
+  @IsIn(['GOODS', 'SERVICE'])
+  @IsOptional()
+  type?: 'GOODS' | 'SERVICE';
+
+  @IsBoolean()
+  @IsOptional()
+  posActive?: boolean;
+
+  @IsInt()
+  @IsOptional()
+  categoryId?: number;
+
+  @IsInt()
+  @IsOptional()
+  posCategoryId?: number;
+
+  @IsInt()
+  @IsOptional()
+  unitId?: number;
 }

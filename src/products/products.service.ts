@@ -1,11 +1,16 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { PrismaService } from '../prisma/prisma.service';
+import { JournalService } from '../accounting/journal.service';
 
 @Injectable()
 export class ProductsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private journalService: JournalService,
+  ) {}
 
   async create(createProductDto: CreateProductDto) {
     return this.prisma.product.create({
@@ -14,10 +19,14 @@ export class ProductsService {
   }
 
   // 🔥 UPDATED: Now includes inventories so the frontend can calculate total aggregated stock
-  async findAll() {
+  async findAll(posActiveOnly?: boolean) {
     return this.prisma.product.findMany({
+      where: posActiveOnly ? { posActive: true } : undefined,
       include: {
-        inventories: true, 
+        inventories: true,
+        category: true,
+        posCategory: true,
+        unit: true,
       },
       orderBy: { id: 'desc' } // Always show the newest products at the top of the list
     });
@@ -151,55 +160,76 @@ export class ProductsService {
     quantity: number;
     type: 'TRANSFER' | 'WRITE_OFF' | 'ADJUSTMENT';
     reason?: string;
+    // ADJUSTMENT only — valuation for a brand-new batch with no source to inherit cost from.
+    // Ignored when the batch already exists (its existing cost is kept) or when TRANSFER/
+    // WRITE_OFF carry a source cost instead.
+    unitCost?: number;
   }) {
-    const { productId, batchNumber, fromWarehouseId, toWarehouseId, quantity, type, reason } = data;
+    const { productId, batchNumber, fromWarehouseId, toWarehouseId, quantity, type, reason, unitCost } = data;
 
     if (quantity <= 0) throw new BadRequestException('Quantity must be greater than zero.');
 
     return this.prisma.$transaction(async (tx) => {
-      
-      // 1. DEDUCT FROM SOURCE WAREHOUSE (If applicable)
-      if (fromWarehouseId) {
-        const sourceInventory = await tx.inventory.findUnique({
-          where: { productId_warehouseId_batchNumber: { productId, warehouseId: fromWarehouseId, batchNumber } }
-        });
 
-        if (!sourceInventory || sourceInventory.quantity < quantity) {
+      // 1. DEDUCT FROM SOURCE WAREHOUSE (If applicable)
+      // Captured up front — needed both to carry cost to the destination (TRANSFER) and to
+      // value the GL entry for a WRITE_OFF, since the row is gone by the time we'd read it after.
+      let sourceUnitCost: number | undefined;
+      if (fromWarehouseId) {
+        const sourceRow = await tx.inventory.findUnique({
+          where: { productId_warehouseId_batchNumber: { productId, warehouseId: fromWarehouseId, batchNumber } },
+        });
+        sourceUnitCost = sourceRow?.unitCost;
+
+        // Conditional update — the sufficiency check and decrement happen as one atomic
+        // statement, so two concurrent transfers/write-offs against the same low-stock batch
+        // can't both pass a separate pre-check and drive quantity negative.
+        const deducted = await tx.inventory.updateMany({
+          where: { productId, warehouseId: fromWarehouseId, batchNumber, quantity: { gte: quantity } },
+          data: { quantity: { decrement: quantity } },
+        });
+        if (deducted.count === 0) {
           throw new BadRequestException(`Insufficient stock in source warehouse for batch ${batchNumber}.`);
         }
-
-        await tx.inventory.update({
-          where: { id: sourceInventory.id },
-          data: { quantity: { decrement: quantity } }
-        });
       }
 
       // 2. ADD TO DESTINATION WAREHOUSE (If applicable)
+      let destinationUnitCost: number | undefined;
       if (toWarehouseId) {
         const destInventory = await tx.inventory.findUnique({
           where: { productId_warehouseId_batchNumber: { productId, warehouseId: toWarehouseId, batchNumber } }
         });
 
+        // Carry over the source batch's expiry/cost if this is a transfer (not a fresh add).
+        let sourceInfo: { expiryDate: Date | null; unitCost: number } | null = null;
+        if (fromWarehouseId) {
+          sourceInfo = await tx.inventory.findUnique({
+            where: { productId_warehouseId_batchNumber: { productId, warehouseId: fromWarehouseId, batchNumber } },
+          });
+        }
+
         if (destInventory) {
-          // Add to existing batch
+          // Add to existing batch — weighted-average the cost if an incoming cost is known
+          // (a TRANSFER's source batch, or a caller-supplied cost on an ADJUSTMENT), same
+          // reasoning as receipts merging into an existing batch at a different cost.
+          const incomingUnitCost = sourceInfo?.unitCost ?? unitCost;
+          const blendedUnitCost = incomingUnitCost !== undefined
+            ? (destInventory.quantity * destInventory.unitCost + quantity * incomingUnitCost) / (destInventory.quantity + quantity)
+            : destInventory.unitCost;
           await tx.inventory.update({
             where: { id: destInventory.id },
-            data: { quantity: { increment: quantity } }
+            data: { quantity: { increment: quantity }, unitCost: blendedUnitCost }
           });
+          destinationUnitCost = blendedUnitCost;
         } else {
-          // Create new batch in destination warehouse
-          // Note: We carry over the expiry date from the source if it's a transfer
-          let expiryDate = null;
-          if (fromWarehouseId) {
-             const sourceInfo = await tx.inventory.findUnique({
-                where: { productId_warehouseId_batchNumber: { productId, warehouseId: fromWarehouseId, batchNumber } }
-             });
-             expiryDate = sourceInfo?.expiryDate;
-          }
-
+          // Create new batch in destination warehouse — prefer a source batch's cost
+          // (TRANSFER), then a caller-supplied cost (ADJUSTMENT), then 0 (untracked).
+          destinationUnitCost = sourceInfo?.unitCost ?? unitCost ?? 0;
           await tx.inventory.create({
             data: {
-              productId, warehouseId: toWarehouseId, batchNumber, quantity, expiryDate
+              productId, warehouseId: toWarehouseId, batchNumber, quantity,
+              expiryDate: sourceInfo?.expiryDate ?? null,
+              unitCost: destinationUnitCost,
             }
           });
         }
@@ -212,8 +242,50 @@ export class ProductsService {
         }
       });
 
+      // 4. POST TO THE GENERAL LEDGER
+      // TRANSFER moves the same value between warehouses (cost is carried, not re-valued) —
+      // total inventory value is unchanged, so it has no GL impact. WRITE_OFF and ADJUSTMENT
+      // both post against 5100 "Inventory Adjustment" vs 1200 "Inventory", mirroring the
+      // COGS/receipt posting pattern elsewhere in this codebase. Skipped when the batch's cost
+      // is untracked (0) — same "skip zero-value entries" convention used for COGS/receipts.
+      if (type === 'WRITE_OFF') {
+        const value = (sourceUnitCost ?? 0) * quantity;
+        if (value > 0) {
+          const [adjustmentAccountId, inventoryAccountId] = await Promise.all([
+            this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY_ADJUSTMENT),
+            this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY),
+          ]);
+          await this.journalService.postEntry(tx, {
+            sourceType: 'STOCK_ADJUSTMENT',
+            sourceId: movementLog.id,
+            memo: `Stock write-off — batch ${batchNumber}${reason ? ` (${reason})` : ''}`,
+            lines: [
+              { accountId: adjustmentAccountId, debit: value },
+              { accountId: inventoryAccountId, credit: value },
+            ],
+          });
+        }
+      } else if (type === 'ADJUSTMENT') {
+        const value = (destinationUnitCost ?? 0) * quantity;
+        if (value > 0) {
+          const [inventoryAccountId, adjustmentAccountId] = await Promise.all([
+            this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY),
+            this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY_ADJUSTMENT),
+          ]);
+          await this.journalService.postEntry(tx, {
+            sourceType: 'STOCK_ADJUSTMENT',
+            sourceId: movementLog.id,
+            memo: `Stock adjustment — batch ${batchNumber}${reason ? ` (${reason})` : ''}`,
+            lines: [
+              { accountId: inventoryAccountId, debit: value },
+              { accountId: adjustmentAccountId, credit: value },
+            ],
+          });
+        }
+      }
+
       return movementLog;
-    });
+    }, { timeout: 15000 });
   }
 
   async findOne(id: any) { // Use 'any' or 'string' to handle the incoming param
@@ -225,11 +297,14 @@ export class ProductsService {
     }
 
     return this.prisma.product.findUnique({
-      where: { id: numericId }, 
-      include: { 
-        inventories: { 
-          include: { warehouse: true } 
-        } 
+      where: { id: numericId },
+      include: {
+        inventories: {
+          include: { warehouse: true }
+        },
+        category: true,
+        posCategory: true,
+        unit: true,
       }
     });
   }

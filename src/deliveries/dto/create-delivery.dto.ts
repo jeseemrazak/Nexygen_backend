@@ -1,4 +1,4 @@
-import { IsInt, IsArray, ValidateNested, IsString, Min } from 'class-validator';
+import { IsInt, IsArray, ValidateNested, IsString, IsOptional, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 class DeliveryItemDto {
@@ -9,8 +9,10 @@ class DeliveryItemDto {
   @Min(1)
   quantity: number;
 
+  // Omitted for a Service-type line — services have no batch/warehouse stock to pick from.
   @IsString()
-  batchNumber: string;
+  @IsOptional()
+  batchNumber?: string;
 }
 
 export class CreateDeliveryDto {

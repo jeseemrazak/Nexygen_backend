@@ -33,8 +33,8 @@ export class ProductsController {
     return this.productsService.getStockMovements();
   }
   @Get()
-  async findAll() {
-    return this.productsService.findAll();
+  async findAll(@Query('posActiveOnly') posActiveOnly?: string) {
+    return this.productsService.findAll(posActiveOnly === 'true');
   }
 
   // 🔥 MUST BE ABOVE :id ROUTE

@@ -11,6 +11,7 @@ class BillItemDto {
 
   // Optional override of the PO's ordered unit cost, for real price variance vs. the actual supplier invoice.
   @IsNumber()
+  @Min(0)
   @IsOptional()
   unitCost?: number;
 }
