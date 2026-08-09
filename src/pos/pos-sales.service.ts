@@ -10,6 +10,7 @@ import { LoyaltyService } from '../loyalty/loyalty.service';
 const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   paymentMethod: true,
+  payments: { include: { paymentMethod: true } },
   servedBy: { select: { id: true, name: true } },
   session: { include: { warehouse: true } },
   customer: true,
@@ -29,17 +30,47 @@ export class PosSalesService {
   // and posts two journal entries — revenue (Dr Cash/Bank/AR, Cr Sales Revenue) and COGS
   // (Dr COGS, Cr Inventory, skipped if no product in the cart has a cost price set yet).
   async create(dto: CreatePosSaleDto) {
-    const session = await this.prisma.posSession.findUnique({ where: { id: dto.sessionId } });
+    const { result, stockDecrements } = await this.prisma.$transaction(
+      async (tx) => this.createInTx(tx, dto),
+      { timeout: 15000 },
+    );
+    this.checkLowStockAfterDecrements(stockDecrements).catch(() => {});
+    return result;
+  }
+
+  // Same checkout logic as create(), but runs entirely against a caller-supplied tx client so
+  // it can be composed into a larger atomic operation. Mirrors the JournalService
+  // voidEntry/voidEntryInTx split already used for the same reason.
+  async createInTx(
+    tx: any,
+    dto: CreatePosSaleDto,
+  ): Promise<{ result: any; stockDecrements: { productId: number; name: string; quantity: number }[] }> {
+    const session = await tx.posSession.findUnique({ where: { id: dto.sessionId } });
     if (!session) throw new NotFoundException(`Session ${dto.sessionId} not found`);
     if (session.status !== 'OPEN') throw new BadRequestException(`Session ${dto.sessionId} is not open`);
 
-    const paymentMethod = await this.prisma.paymentMethod.findUnique({ where: { id: dto.paymentMethodId } });
-    if (!paymentMethod) throw new NotFoundException(`Payment method ${dto.paymentMethodId} not found`);
+    // Split-tender (payments[]) or a single paymentMethodId — exactly one of the two, resolved
+    // up front into one common `tenders` shape so everything below (GL posting, PosSalePayment
+    // rows) never needs to branch on which path was used.
+    if (!dto.paymentMethodId && (!dto.payments || dto.payments.length === 0)) {
+      throw new BadRequestException('Provide either paymentMethodId or payments[]');
+    }
+    const tenders = dto.payments && dto.payments.length > 0 ? dto.payments : [{ paymentMethodId: dto.paymentMethodId!, amount: undefined as any }];
+
+    const paymentMethods = await tx.paymentMethod.findMany({ where: { id: { in: tenders.map((t) => t.paymentMethodId) } } });
+    const paymentMethodMap = new Map<number, any>(paymentMethods.map((m: any) => [m.id, m]));
+    for (const t of tenders) {
+      if (!paymentMethodMap.has(t.paymentMethodId)) throw new NotFoundException(`Payment method ${t.paymentMethodId} not found`);
+    }
+    // The "primary" method is stored on PosSale.paymentMethodId itself (a single, NOT NULL
+    // column) for backward-compat display in code that predates split-tender — the real,
+    // itemized breakdown always lives in PosSalePayment, read from there by anything that cares.
+    const primaryPaymentMethod = paymentMethodMap.get(tenders[0].paymentMethodId);
 
     if (dto.items.length === 0) throw new BadRequestException('A sale needs at least one item');
 
-    const products = await this.prisma.product.findMany({ where: { id: { in: dto.items.map((i) => i.productId) } } });
-    const productMap = new Map(products.map((p) => [p.id, p]));
+    const products = await tx.product.findMany({ where: { id: { in: dto.items.map((i) => i.productId) } } });
+    const productMap = new Map<number, any>(products.map((p: any) => [p.id, p]));
 
     let subtotal = 0;
     for (const item of dto.items) {
@@ -49,11 +80,34 @@ export class PosSalesService {
     }
 
     const discountAmount = Math.min(Math.max(dto.discountAmount || 0, 0), subtotal);
-    const totalAmount = subtotal - discountAmount;
+    const netAfterDiscount = subtotal - discountAmount;
+
+    // Tax is applied on top of (subtotal - discount), never baked into it — same reasoning as
+    // every other document's taxAmount field.
+    let taxAmount = 0;
+    if (dto.taxId) {
+      const tax = await tx.tax.findUnique({ where: { id: dto.taxId } });
+      if (!tax) throw new BadRequestException(`Tax ${dto.taxId} not found`);
+      taxAmount = Math.round(netAfterDiscount * (tax.rate / 100) * 100) / 100;
+    }
+    const totalAmount = netAfterDiscount + taxAmount;
+
+    // Single-payment path: the one tender covers the whole total, same as before split-tender
+    // existed. Split-tender path: every tender's amount was supplied by the caller and must sum
+    // to the total exactly (to the cent) — otherwise the sale would be over- or under-tendered
+    // with no record of where the discrepancy went.
+    if (tenders.length === 1 && tenders[0].amount === undefined) {
+      tenders[0].amount = totalAmount;
+    } else {
+      const tenderedSum = tenders.reduce((s, t) => s + t.amount, 0);
+      if (Math.abs(tenderedSum - totalAmount) > 0.01) {
+        throw new BadRequestException(`Payments total ${tenderedSum.toFixed(2)} does not match the sale total ${totalAmount.toFixed(2)}`);
+      }
+    }
 
     let clientName = dto.clientName;
     if (dto.customerId) {
-      const customer = await this.prisma.customer.findUnique({ where: { id: dto.customerId } });
+      const customer = await tx.customer.findUnique({ where: { id: dto.customerId } });
       if (customer) clientName = customer.name;
     }
 
@@ -63,20 +117,25 @@ export class PosSalesService {
 
     const stockDecrements: { productId: number; name: string; quantity: number }[] = [];
 
-    const result = await this.prisma.$transaction(async (tx) => {
-      const sale = await tx.posSale.create({
+    const sale = await tx.posSale.create({
         data: {
           sessionId: dto.sessionId,
           warehouseId: session.warehouseId,
-          paymentMethodId: dto.paymentMethodId,
+          paymentMethodId: primaryPaymentMethod.id,
           servedById,
           clientName,
           customerId: dto.customerId,
           totalAmount,
           discountAmount,
+          taxId: dto.taxId,
+          taxAmount,
         },
       });
       await tx.posSale.update({ where: { id: sale.id }, data: { invoiceNumber: `POS-${String(sale.id).padStart(6, '0')}` } });
+
+      await tx.posSalePayment.createMany({
+        data: tenders.map((t) => ({ posSaleId: sale.id, paymentMethodId: t.paymentMethodId, amount: t.amount })),
+      });
 
       if (dto.customerId && pointsEarned > 0) {
         await tx.loyaltyTransaction.create({
@@ -141,30 +200,37 @@ export class PosSalesService {
 
       if (totalAmount > 0) {
         const revenueAccountId = await this.journalService.getMappedAccountId(tx, AccountMappingRole.SALES_REVENUE);
-        if (paymentMethod.type === 'ACCOUNT_RECEIVABLE') {
-          const arAccountId = await this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE);
-          await this.journalService.postEntry(tx, {
-            sourceType: 'POS_SALE',
-            sourceId: sale.id,
-            memo: `POS sale #${sale.id}`,
-            lines: [
-              { accountId: arAccountId, debit: totalAmount, partyType: 'CUSTOMER', partyName: dto.clientName || 'Walk-in' },
-              { accountId: revenueAccountId, credit: totalAmount },
-            ],
-          });
-        } else {
-          const cashAccountId = await this.journalService.resolveJournalAccount(tx, paymentMethod.journalId, 'debit', AccountMappingRole.CASH_BANK);
-          await this.journalService.postEntry(tx, {
-            sourceType: 'POS_SALE',
-            sourceId: sale.id,
-            journalId: paymentMethod.journalId ?? undefined,
-            memo: `POS sale #${sale.id}`,
-            lines: [
-              { accountId: cashAccountId, debit: totalAmount },
-              { accountId: revenueAccountId, credit: totalAmount },
-            ],
-          });
+        const taxPayableAccountId = taxAmount > 0 ? await this.journalService.getMappedAccountId(tx, AccountMappingRole.TAX_PAYABLE) : null;
+
+        // One debit line per tender (each resolved through its own payment method's account —
+        // AR if that method is ACCOUNT_RECEIVABLE, its journal's cash/bank account otherwise),
+        // one credit line for net revenue and (if any) one more for tax collected. A single-tender,
+        // no-tax sale produces exactly the same two-line entry this always posted; split-tender and
+        // tax just add more lines on their respective sides.
+        const debitLines: { accountId: number; debit: number; partyType?: 'CUSTOMER'; partyName?: string }[] = [];
+        let primaryJournalId: number | undefined;
+        for (const t of tenders) {
+          const method = paymentMethodMap.get(t.paymentMethodId);
+          if (method.type === 'ACCOUNT_RECEIVABLE') {
+            const arAccountId = await this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE);
+            debitLines.push({ accountId: arAccountId, debit: t.amount, partyType: 'CUSTOMER', partyName: dto.clientName || 'Walk-in' });
+          } else {
+            const cashAccountId = await this.journalService.resolveJournalAccount(tx, method.journalId, 'debit', AccountMappingRole.CASH_BANK);
+            debitLines.push({ accountId: cashAccountId, debit: t.amount });
+            if (primaryJournalId === undefined) primaryJournalId = method.journalId ?? undefined;
+          }
         }
+
+        const creditLines: { accountId: number; credit: number }[] = [{ accountId: revenueAccountId, credit: netAfterDiscount }];
+        if (taxAmount > 0) creditLines.push({ accountId: taxPayableAccountId!, credit: taxAmount });
+
+        await this.journalService.postEntry(tx, {
+          sourceType: 'POS_SALE',
+          sourceId: sale.id,
+          journalId: tenders.length === 1 ? primaryJournalId : undefined,
+          memo: `POS sale #${sale.id}`,
+          lines: [...debitLines, ...creditLines].map((l) => ({ ...l, warehouseId: session.warehouseId })),
+        });
       }
 
       // COGS only posts once cost prices are actually set — a 0-cost cart means "not tracked yet".
@@ -178,22 +244,19 @@ export class PosSalesService {
           sourceId: sale.id,
           memo: `COGS for POS sale #${sale.id}`,
           lines: [
-            { accountId: cogsAccountId, debit: totalCost },
-            { accountId: inventoryAccountId, credit: totalCost },
+            { accountId: cogsAccountId, debit: totalCost, warehouseId: session.warehouseId },
+            { accountId: inventoryAccountId, credit: totalCost, warehouseId: session.warehouseId },
           ],
         });
       }
 
-      return tx.posSale.findUnique({ where: { id: sale.id }, include: DETAIL_INCLUDE });
-    }, { timeout: 15000 });
-
-    this.checkLowStockAfterDecrements(stockDecrements).catch(() => {});
-    return result;
+    const result = await tx.posSale.findUnique({ where: { id: sale.id }, include: DETAIL_INCLUDE });
+    return { result, stockDecrements };
   }
 
   // Runs after the transaction commits — see the equivalent method in DeliveriesService for why
   // "before" is reconstructed from "after + quantity" rather than read inside the transaction.
-  private async checkLowStockAfterDecrements(decrements: { productId: number; name: string; quantity: number }[]) {
+  async checkLowStockAfterDecrements(decrements: { productId: number; name: string; quantity: number }[]) {
     for (const dec of decrements) {
       const totals = await this.prisma.inventory.aggregate({
         where: { productId: dec.productId },

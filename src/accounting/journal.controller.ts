@@ -1,6 +1,7 @@
 import { Controller, Get, Post, Body, Query, Param } from '@nestjs/common';
 import { JournalService } from './journal.service';
 import { AgingService } from './aging.service';
+import { FxRevaluationService } from './fx-revaluation.service';
 import { CreateJournalEntryDto } from './dto/create-journal-entry.dto';
 import { VoidJournalEntryDto } from './dto/void-journal-entry.dto';
 import { Roles } from '../auth/roles.decorator';
@@ -11,6 +12,7 @@ export class JournalController {
   constructor(
     private readonly journalService: JournalService,
     private readonly agingService: AgingService,
+    private readonly fxRevaluationService: FxRevaluationService,
   ) {}
 
   @Post('journal-entries')
@@ -75,6 +77,21 @@ export class JournalController {
   @Get('reports/balance-sheet')
   getBalanceSheet(@Query('asOf') asOf?: string) {
     return this.journalService.getBalanceSheet(asOf);
+  }
+
+  @Get('reports/outlet-pnl')
+  getOutletProfitAndLoss(@Query('from') from?: string, @Query('to') to?: string) {
+    return this.journalService.getOutletProfitAndLoss(from, to);
+  }
+
+  @Get('reports/cash-flow')
+  getCashFlowStatement(@Query('from') from: string, @Query('to') to: string) {
+    return this.journalService.getCashFlowStatement(from, to);
+  }
+
+  @Get('reports/fx-revaluation')
+  getFxRevaluation() {
+    return this.fxRevaluationService.getFxRevaluation();
   }
 
   @Get('partner-ledger')

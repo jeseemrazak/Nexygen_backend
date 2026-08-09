@@ -34,6 +34,9 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { LoyaltyModule } from './loyalty/loyalty.module';
 import { VehiclesModule } from './vehicles/vehicles.module';
 import { JobOrdersModule } from './job-orders/job-orders.module';
+import { LeadsModule } from './leads/leads.module';
+import { AppointmentsModule } from './appointments/appointments.module';
+import { TasksModule } from './tasks/tasks.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
@@ -72,6 +75,9 @@ import { RolesGuard } from './auth/roles.guard';
     LoyaltyModule,
     VehiclesModule,
     JobOrdersModule,
+    LeadsModule,
+    AppointmentsModule,
+    TasksModule,
   ],
   controllers: [AppController],
   providers: [

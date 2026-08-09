@@ -19,9 +19,12 @@ export class ProductsService {
   }
 
   // 🔥 UPDATED: Now includes inventories so the frontend can calculate total aggregated stock
-  async findAll(posActiveOnly?: boolean) {
+  async findAll(posActiveOnly?: boolean, activeOnly?: boolean) {
+    const where: any = {};
+    if (posActiveOnly) where.posActive = true;
+    if (activeOnly) where.isActive = true;
     return this.prisma.product.findMany({
-      where: posActiveOnly ? { posActive: true } : undefined,
+      where: Object.keys(where).length ? where : undefined,
       include: {
         inventories: true,
         category: true,

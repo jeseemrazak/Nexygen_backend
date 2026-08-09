@@ -40,7 +40,7 @@ export class AccountsController {
   }
 
   @Get(':id/ledger')
-  getLedger(@Param('id') id: string) {
-    return this.accountsService.getLedger(+id);
+  getLedger(@Param('id') id: string, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.accountsService.getLedger(+id, from, to);
   }
 }

@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateSalesOrderDto } from './dto/create-sales-order.dto';
 import { ConfirmSalesOrderDto } from './dto/confirm-sales-order.dto';
 import { applyDiscount, DiscountType } from '../common/discount.util';
+import { computeTaxAmount } from '../common/tax.util';
 import { NotificationsService } from '../notifications/notifications.service';
 
 const DETAIL_INCLUDE = {
@@ -33,7 +34,9 @@ export class SalesOrdersService {
       return { ...i, listPrice: i.listPrice ?? null, price };
     });
     const subtotal = items.reduce((sum, i) => sum + i.quantity * i.price, 0);
-    const totalAmount = applyDiscount(subtotal, dto.discountType, dto.discountValue);
+    const netAfterDiscount = applyDiscount(subtotal, dto.discountType, dto.discountValue);
+    const taxAmount = await computeTaxAmount(this.prisma, dto.taxId, netAfterDiscount);
+    const totalAmount = netAfterDiscount + taxAmount;
 
     let clientName = dto.clientName;
     if (dto.customerId) {
@@ -50,6 +53,8 @@ export class SalesOrdersService {
         termsAndConditions: dto.termsAndConditions,
         discountType: dto.discountType,
         discountValue: dto.discountValue ?? 0,
+        taxId: dto.taxId,
+        taxAmount,
         subtotal,
         totalAmount,
         items: {
@@ -78,6 +83,8 @@ export class SalesOrdersService {
     termsAndConditions?: string;
     discountType?: DiscountType | null;
     discountValue?: number;
+    taxId?: number | null;
+    taxAmount?: number;
     subtotal: number;
     totalAmount: number;
     items: {
@@ -98,6 +105,8 @@ export class SalesOrdersService {
         termsAndConditions: dto.termsAndConditions,
         discountType: dto.discountType,
         discountValue: dto.discountValue ?? 0,
+        taxId: dto.taxId,
+        taxAmount: dto.taxAmount ?? 0,
         subtotal: dto.subtotal,
         totalAmount: dto.totalAmount,
         items: {

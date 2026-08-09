@@ -2,12 +2,14 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
+import { ReturnDeliveryDto } from './dto/return-delivery.dto';
 import { AccountMappingRole, DeliveryStatus } from '@prisma/client';
 import { NotificationsService } from '../notifications/notifications.service';
 
 const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   salesOrder: { include: { warehouse: true, user: { select: { name: true, email: true } } } },
+  returns: { include: { items: true }, orderBy: { createdAt: 'desc' as const } },
 };
 
 @Injectable()
@@ -130,8 +132,8 @@ export class DeliveriesService {
           sourceId: delivery.id,
           memo: `COGS for Delivery #${delivery.id} (Sales Order #${dto.salesOrderId})`,
           lines: [
-            { accountId: cogsAccountId, debit: totalCost },
-            { accountId: inventoryAccountId, credit: totalCost },
+            { accountId: cogsAccountId, debit: totalCost, warehouseId: order.warehouseId },
+            { accountId: inventoryAccountId, credit: totalCost, warehouseId: order.warehouseId },
           ],
         });
       }
@@ -162,6 +164,110 @@ export class DeliveriesService {
       const after = totals._sum.quantity ?? 0;
       await this.notifications.notifyLowStockIfCrossed({ id: dec.productId, name: dec.name }, after + dec.quantity, after);
     }
+  }
+
+  // Restocks whatever quantity is returned and posts a fresh Dr Inventory / Cr COGS entry sized
+  // to just the returned portion — the original delivery's COGS entry covers the WHOLE delivery
+  // and can't be partially voided, and returns are frequently partial, so a new reversing entry
+  // is posted instead of voiding anything. "Already returned" is always summed live from
+  // DeliveryReturnItem (never a mutable counter), same ledger-only convention used elsewhere.
+  async returnItems(deliveryId: number, dto: ReturnDeliveryDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const delivery = await tx.delivery.findUnique({
+        where: { id: deliveryId },
+        include: { items: true, salesOrder: true },
+      });
+      if (!delivery) throw new NotFoundException(`Delivery ${deliveryId} not found`);
+
+      let totalCost = 0;
+      const deliveryReturn = await tx.deliveryReturn.create({
+        data: { deliveryId, reason: dto.reason },
+      });
+
+      for (const reqItem of dto.items) {
+        const deliveryItem = delivery.items.find((i) => i.id === reqItem.deliveryItemId);
+        if (!deliveryItem) {
+          throw new BadRequestException(`Item ${reqItem.deliveryItemId} is not part of Delivery #${deliveryId}`);
+        }
+
+        const { _sum } = await tx.deliveryReturnItem.aggregate({
+          where: { deliveryItemId: deliveryItem.id },
+          _sum: { quantity: true },
+        });
+        const alreadyReturned = _sum.quantity || 0;
+        const remaining = deliveryItem.quantity - alreadyReturned;
+        if (reqItem.quantity > remaining) {
+          throw new BadRequestException(`Cannot return ${reqItem.quantity} for item ${deliveryItem.id}; only ${remaining} remaining`);
+        }
+
+        await tx.deliveryReturnItem.create({
+          data: { deliveryReturnId: deliveryReturn.id, deliveryItemId: deliveryItem.id, quantity: reqItem.quantity },
+        });
+
+        const productData = await tx.product.findUnique({ where: { id: deliveryItem.productId } });
+        const isService = deliveryItem.batchNumber === 'SERVICE' || productData?.type === 'SERVICE';
+        let unitCost = productData?.costPrice ?? 0;
+
+        if (!isService) {
+          const inv = await tx.inventory.findUnique({
+            where: {
+              productId_warehouseId_batchNumber: {
+                productId: deliveryItem.productId,
+                warehouseId: delivery.salesOrder.warehouseId,
+                batchNumber: deliveryItem.batchNumber,
+              },
+            },
+          });
+          unitCost = inv && inv.unitCost > 0 ? inv.unitCost : (productData?.costPrice ?? 0);
+
+          await tx.inventory.upsert({
+            where: {
+              productId_warehouseId_batchNumber: {
+                productId: deliveryItem.productId,
+                warehouseId: delivery.salesOrder.warehouseId,
+                batchNumber: deliveryItem.batchNumber,
+              },
+            },
+            update: { quantity: { increment: reqItem.quantity } },
+            create: {
+              productId: deliveryItem.productId,
+              warehouseId: delivery.salesOrder.warehouseId,
+              batchNumber: deliveryItem.batchNumber,
+              quantity: reqItem.quantity,
+              unitCost,
+            },
+          });
+        }
+        totalCost += reqItem.quantity * unitCost;
+
+        await tx.salesOrderItem.update({
+          where: { id: deliveryItem.salesOrderItemId },
+          data: { quantityDelivered: { decrement: reqItem.quantity } },
+        });
+      }
+
+      if (delivery.salesOrder.status === 'DONE') {
+        await tx.salesOrder.update({ where: { id: delivery.salesOrderId }, data: { status: 'CONFIRMED' } });
+      }
+
+      if (totalCost > 0) {
+        const [cogsAccountId, inventoryAccountId] = await Promise.all([
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.COGS),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY),
+        ]);
+        await this.journalService.postEntry(tx, {
+          sourceType: 'SALES_DELIVERY_RETURN',
+          sourceId: deliveryReturn.id,
+          memo: `Return against Delivery #${deliveryId}${dto.reason ? ` (${dto.reason})` : ''}`,
+          lines: [
+            { accountId: inventoryAccountId, debit: totalCost, warehouseId: delivery.salesOrder.warehouseId },
+            { accountId: cogsAccountId, credit: totalCost, warehouseId: delivery.salesOrder.warehouseId },
+          ],
+        });
+      }
+
+      return tx.delivery.findUnique({ where: { id: deliveryId }, include: DETAIL_INCLUDE });
+    }, { timeout: 15000 });
   }
 
   async findAll(salesOrderId?: number) {

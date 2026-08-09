@@ -29,12 +29,16 @@ export class AgingService {
 
     const rows = invoices.map((inv) => {
       const outstanding = inv.totalAmount - inv.amountPaid;
-      const daysOverdue = Math.floor((asOfDate.getTime() - inv.createdAt.getTime()) / 86400000);
+      // Falls back to createdAt for invoices posted before Payment Terms existed — dueDate is
+      // the real "when is this actually late" line once a term was resolved onto the invoice.
+      const dueDate = inv.dueDate ?? inv.createdAt;
+      const daysOverdue = Math.floor((asOfDate.getTime() - dueDate.getTime()) / 86400000);
       return {
         orderId: inv.id,
         invoiceNumber: inv.invoiceNumber,
         clientName: inv.salesOrder.clientName || 'Walk-in',
         invoiceDate: inv.createdAt,
+        dueDate,
         totalAmount: inv.totalAmount,
         amountPaid: inv.amountPaid,
         outstanding,
@@ -65,12 +69,14 @@ export class AgingService {
 
     const rows = bills.map((bill) => {
       const outstanding = bill.totalAmount - bill.amountPaid;
-      const daysOverdue = Math.floor((asOfDate.getTime() - bill.createdAt.getTime()) / 86400000);
+      const dueDate = bill.dueDate ?? bill.createdAt;
+      const daysOverdue = Math.floor((asOfDate.getTime() - dueDate.getTime()) / 86400000);
       return {
         purchaseOrderId: bill.purchaseOrderId,
         invoiceNumber: bill.billNumber,
         supplierName: bill.purchaseOrder.supplier.name,
         invoiceDate: bill.createdAt,
+        dueDate,
         totalAmount: bill.totalAmount,
         amountPaid: bill.amountPaid,
         outstanding,

@@ -25,6 +25,10 @@ export class CreatePurchaseOrderDto {
   @IsOptional()
   reference?: string;
 
+  @IsInt()
+  @IsOptional()
+  taxId?: number;
+
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => PurchaseOrderItemDto)

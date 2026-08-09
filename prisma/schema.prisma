@@ -42,6 +42,7 @@ enum StockMovementType {
   WRITE_OFF
   ADJUSTMENT
   PURCHASE_RECEIPT
+  RETURN_TO_SUPPLIER
 }
 
 enum PurchaseOrderStatus {
@@ -94,11 +95,15 @@ enum JournalSourceType {
   POS_SALE
   POS_SALE_COGS
   SALES_DELIVERY_COGS
+  SALES_DELIVERY_RETURN
+  PURCHASE_RECEIPT_RETURN
   PAYROLL_RUN
   PAYROLL_DISBURSEMENT
   LOAN_ISSUANCE
   EOS_ACCRUAL
   STOCK_ADJUSTMENT
+  RESTAURANT_TIP
+  POS_SESSION_VARIANCE
 }
 
 enum PartyType {
@@ -144,17 +149,21 @@ enum EmployeeLoanStatus {
 
 // --- CORE TABLES ---
 model User {
-  id                    Int          @id @default(autoincrement())
-  email                 String       @unique
+  id                    Int            @id @default(autoincrement())
+  email                 String         @unique
   password              String
   name                  String?
-  role                  Role         @default(MERCHANDISER)
+  role                  Role           @default(MERCHANDISER)
   salesOrders           SalesOrder[] // A merchandiser can be assigned many sales orders
   quotations            Quotation[]
   employee              Employee?
   jobOrdersAsTechnician JobOrder[]
-  createdAt             DateTime     @default(now())
-  updatedAt             DateTime     @updatedAt
+  leadsAssigned         Lead[]
+  appointmentsAsStaff   Appointment[]
+  tasksAssigned         Task[]         @relation("TaskAssignee")
+  tasksCreated          Task[]         @relation("TaskCreator")
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
 }
 
 model Warehouse {
@@ -168,6 +177,7 @@ model Warehouse {
   rfqs           RFQ[]
   posSessions    PosSession[]
   jobOrders      JobOrder[]
+  journalLines   JournalLine[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 }
@@ -190,6 +200,10 @@ model Product {
   type               ProductType         @default(GOODS)
   // Defaults true so no existing product silently disappears from the POS checkout grid.
   posActive          Boolean             @default(true)
+  // General archive flag — distinct from posActive (which only controls POS checkout
+  // visibility). An archived product drops out of catalog/creation pickers everywhere but
+  // keeps every historical relation (orders, invoices, GL) intact; never hard-deleted.
+  isActive           Boolean             @default(true)
   categoryId         Int?
   category           ProductCategory?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   posCategoryId      Int?
@@ -259,6 +273,12 @@ model SalesOrder {
   discountType  String?
   discountValue Float   @default(0)
 
+  // Applied to (subtotal - discount), added on top — never baked into line prices like a
+  // discount is, since tax is shown as its own line on every document/receipt.
+  taxId     Int?
+  tax       Tax?    @relation(fields: [taxId], references: [id])
+  taxAmount Float   @default(0)
+
   termsAndConditions String?
   // Customer's own PO/reference number for this order — free text.
   customerReference  String?
@@ -321,6 +341,7 @@ model Delivery {
 
   proofOfDelivery String?
   items           DeliveryItem[]
+  returns         DeliveryReturn[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -343,6 +364,31 @@ model DeliveryItem {
 
   productId Int
   product   Product @relation(fields: [productId], references: [id])
+
+  returnItems DeliveryReturnItem[]
+}
+
+// A customer return against an already-shipped Delivery — restocks inventory and reverses the
+// proportional COGS with a fresh entry (not a void of the original, since a return is often
+// partial and the original COGS entry covers the whole delivery). Ledger-style: any number of
+// returns can be logged against the same Delivery; "already returned" is always summed from
+// this table, never a mutable counter on DeliveryItem.
+model DeliveryReturn {
+  id         Int                  @id @default(autoincrement())
+  deliveryId Int
+  delivery   Delivery             @relation(fields: [deliveryId], references: [id])
+  reason     String?
+  items      DeliveryReturnItem[]
+  createdAt  DateTime             @default(now())
+}
+
+model DeliveryReturnItem {
+  id               Int            @id @default(autoincrement())
+  deliveryReturnId Int
+  deliveryReturn   DeliveryReturn @relation(fields: [deliveryReturnId], references: [id], onDelete: Cascade)
+  deliveryItemId   Int
+  deliveryItem     DeliveryItem   @relation(fields: [deliveryItemId], references: [id])
+  quantity         Int
 }
 
 // --- INVOICE: the billing document — this is where accounting posts ---
@@ -352,11 +398,34 @@ model Invoice {
   salesOrderId  Int
   salesOrder    SalesOrder @relation(fields: [salesOrderId], references: [id])
 
+  // Net line-item sum, before tax — totalAmount is subtotal + taxAmount (payment/balance logic
+  // always reads totalAmount, unaffected by tax being broken out here).
+  subtotal      Float         @default(0)
+  taxId         Int?
+  tax           Tax?          @relation(fields: [taxId], references: [id])
+  taxAmount     Float         @default(0)
   totalAmount   Float
   paymentStatus PaymentStatus @default(UNPAID)
   amountPaid    Float         @default(0)
+  // Resolved from the customer's default terms (or overridden) at creation time — dueDate is a
+  // frozen snapshot (createdAt + term.days), never recomputed if the term is edited later.
+  paymentTermId Int?
+  paymentTerm   PaymentTerm?  @relation(fields: [paymentTermId], references: [id])
+  dueDate       DateTime?
   items         InvoiceItem[]
   payments      Payment[]
+
+  // Foreign-currency quote, frozen at creation time — totalAmount above is always the real,
+  // posted QAR figure; these three fields are purely an informational overlay + the input the
+  // FX Revaluation report needs. Null currencyId = QAR only (the overwhelming default case).
+  currencyId         Int?
+  currency           Currency? @relation(fields: [currencyId], references: [id])
+  exchangeRate       Float? // units of QAR per 1 unit of currencyId, snapshotted at creation
+  foreignTotalAmount Float? // totalAmount expressed in currencyId, i.e. totalAmount / exchangeRate
+
+  // Set on cancel — every SALES_INVOICE/SALES_PAYMENT journal entry gets voided (reversal
+  // entries posted) at the same time, same "timestamp + audit-safe" convention as PosSale.
+  cancelledAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -410,6 +479,9 @@ model Supplier {
   phone          String?
   email          String?
   address        String?
+  // Default credit terms — carried onto each new Bill for this supplier's PO, editable per-bill.
+  paymentTermId  Int?
+  paymentTerm    PaymentTerm?    @relation(fields: [paymentTermId], references: [id])
   purchaseOrders PurchaseOrder[]
   rfqResponses   RFQResponse[]
   createdAt      DateTime        @default(now())
@@ -424,14 +496,116 @@ model Customer {
   phone               String?
   email               String?
   address             String?
+  // Default credit terms — carried onto each new Invoice for this customer's order, editable per-invoice.
+  paymentTermId       Int?
+  paymentTerm         PaymentTerm?         @relation(fields: [paymentTermId], references: [id])
   quotations          Quotation[]
   salesOrders         SalesOrder[]
   posSales            PosSale[]
   loyaltyTransactions LoyaltyTransaction[]
   vehicles            Vehicle[]
   jobOrders           JobOrder[]
+  leadSource          Lead?
+  appointments        Appointment[]
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
+}
+
+// --- APP STORE: CRM Leads, Appointments, Todo List (each installable independently) ---
+enum LeadStage {
+  NEW
+  CONTACTED
+  QUALIFIED
+  WON
+  LOST
+}
+
+// Prospects, kept separate from the paying-customer Customer directory — a Lead becomes a
+// Customer via an explicit "Convert" action once WON, never silently merged.
+model Lead {
+  id            Int       @id @default(autoincrement())
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  source        String?
+  stage         LeadStage @default(NEW)
+  notes         String?
+
+  assignedToId Int?
+  assignedTo   User? @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  // Set once this Lead is converted — the Lead row stays for history, it just points at the
+  // Customer it became. A Lead can only ever convert once (unique).
+  convertedCustomerId Int?      @unique
+  convertedCustomer   Customer? @relation(fields: [convertedCustomerId], references: [id], onDelete: SetNull)
+
+  appointments Appointment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+// Tied to a Customer or a Lead (or neither, for an internal-only appointment) — never both is
+// enforced at the service layer, not the schema, same "trust the DTO" convention used elsewhere.
+model Appointment {
+  id            Int               @id @default(autoincrement())
+  title         String
+  appointmentAt DateTime
+  status        AppointmentStatus @default(SCHEDULED)
+  notes         String?
+
+  customerId Int?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  leadId Int?
+  lead   Lead? @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  staffId Int?
+  staff   User? @relation(fields: [staffId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+// A shared, assignable task board — any user can see and assign tasks to any other user, no
+// per-user privacy concept (that's the "Personal per-user list" option this codebase did NOT take).
+model Task {
+  id          Int          @id @default(autoincrement())
+  title       String
+  description String?
+  dueDate     DateTime?
+  priority    TaskPriority @default(MEDIUM)
+  status      TaskStatus   @default(TODO)
+
+  assignedToId Int?
+  assignedTo   User? @relation("TaskAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  createdById Int?
+  createdBy   User? @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // --- APP STORE: Vehicle Management + Job Order (both installable independently) ---
@@ -541,6 +715,9 @@ model PurchaseOrder {
   id          Int                 @id @default(autoincrement())
   status      PurchaseOrderStatus @default(DRAFT)
   totalAmount Float               @default(0)
+  taxId       Int?
+  tax         Tax?                @relation(fields: [taxId], references: [id])
+  taxAmount   Float               @default(0)
   reference   String? // Supplier's own invoice/PO number
 
   supplierId Int
@@ -585,7 +762,8 @@ model Receipt {
   purchaseOrderId Int
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
 
-  items ReceiptItem[]
+  items   ReceiptItem[]
+  returns ReceiptReturn[]
 
   createdAt DateTime @default(now())
 }
@@ -606,6 +784,29 @@ model ReceiptItem {
 
   productId Int
   product   Product @relation(fields: [productId], references: [id])
+
+  returnItems ReceiptReturnItem[]
+}
+
+// A return-to-supplier against an already-received Receipt — de-stocks inventory (guarded, can't
+// return more than is still on hand) and reverses the proportional Inventory/Stock-Interim entry
+// with a fresh entry, same "new entry, not a void" reasoning as DeliveryReturn.
+model ReceiptReturn {
+  id        Int                 @id @default(autoincrement())
+  receiptId Int
+  receipt   Receipt             @relation(fields: [receiptId], references: [id])
+  reason    String?
+  items     ReceiptReturnItem[]
+  createdAt DateTime            @default(now())
+}
+
+model ReceiptReturnItem {
+  id              Int           @id @default(autoincrement())
+  receiptReturnId Int
+  receiptReturn   ReceiptReturn @relation(fields: [receiptReturnId], references: [id], onDelete: Cascade)
+  receiptItemId   Int
+  receiptItem     ReceiptItem   @relation(fields: [receiptItemId], references: [id])
+  quantity        Int
 }
 
 // --- BILL: the billing document — this is where accounting posts ---
@@ -615,11 +816,28 @@ model Bill {
   purchaseOrderId Int
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
 
+  subtotal      Float             @default(0)
+  taxId         Int?
+  tax           Tax?              @relation(fields: [taxId], references: [id])
+  taxAmount     Float             @default(0)
   totalAmount   Float
   paymentStatus PaymentStatus     @default(UNPAID)
   amountPaid    Float             @default(0)
+  paymentTermId Int?
+  paymentTerm   PaymentTerm?      @relation(fields: [paymentTermId], references: [id])
+  dueDate       DateTime?
   items         BillItem[]
   payments      PurchasePayment[]
+
+  // Foreign-currency quote, frozen at creation time — see Invoice's identical fields for why.
+  currencyId         Int?
+  currency           Currency? @relation(fields: [currencyId], references: [id])
+  exchangeRate       Float?
+  foreignTotalAmount Float?
+
+  // Set on cancel — every PURCHASE_INVOICE/PURCHASE_PAYMENT journal entry gets voided at the
+  // same time (reversal entries posted), same convention as Invoice.cancelledAt.
+  cancelledAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -669,6 +887,10 @@ model Quotation {
   // Global (whole-document) discount — 'PERCENT' or 'AMOUNT'. Null/0 = no discount.
   discountType  String?
   discountValue Float   @default(0)
+
+  taxId     Int?
+  tax       Tax?    @relation(fields: [taxId], references: [id])
+  taxAmount Float   @default(0)
 
   termsAndConditions String?
   // Customer's own PO/reference number for this quotation — free text.
@@ -806,6 +1028,49 @@ enum AccountMappingRole {
   SALARY_PAYABLE
   EOS_GRATUITY_EXPENSE
   EOS_GRATUITY_ACCRUAL
+  TIPS_PAYABLE
+  CASH_DIFFERENCE_GAIN
+  CASH_DIFFERENCE_LOSS
+  TAX_PAYABLE
+  TAX_RECEIVABLE
+}
+
+// A single flat-rate tax (e.g. "VAT 5%") selectable on a sales/purchase document. Kept
+// deliberately simple — one rate per Tax row, no compound/nested tax support — since nothing in
+// this app's target markets needs tax-on-tax stacking.
+model Tax {
+  id        Int      @id @default(autoincrement())
+  name      String
+  rate      Float // percent, e.g. 5 for 5%
+  isActive  Boolean  @default(true)
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  salesOrders    SalesOrder[]
+  quotations     Quotation[]
+  invoices       Invoice[]
+  purchaseOrders PurchaseOrder[]
+  bills          Bill[]
+  posSales       PosSale[]
+}
+
+// Foreign currencies quotable on an Invoice/Bill on top of the base (QAR) figures — every dollar
+// amount in this app is still computed and posted in QAR exactly as before; a Currency just
+// freezes "at today's rate, this is worth X" for the customer's/supplier's reference and feeds
+// the FX Revaluation report. No line-item pricing is ever denominated in a foreign currency.
+model Currency {
+  id                 Int      @id @default(autoincrement())
+  code               String   @unique // e.g. USD, EUR, SAR
+  name               String
+  symbol             String?
+  // Units of QAR per 1 unit of this currency — e.g. 3.64 for USD. Kept live/editable; each
+  // Invoice/Bill freezes its own snapshot of this rate at creation time (see exchangeRate below).
+  exchangeRateToBase Float
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+
+  invoices Invoice[]
+  bills    Bill[]
 }
 
 model AccountMapping {
@@ -851,6 +1116,19 @@ model PaymentMethod {
   isActive  Boolean           @default(true)
   sortOrder Int               @default(0)
   posSales  PosSale[]
+  posSalePayments PosSalePayment[]
+}
+
+// One row per tender on a sale — even a single-method sale gets exactly one row, so reporting
+// and receipts never need to branch on "was this split-tender or not", they just read this array.
+model PosSalePayment {
+  id              Int           @id @default(autoincrement())
+  posSaleId       Int
+  posSale         PosSale       @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
+  paymentMethodId Int
+  paymentMethod   PaymentMethod @relation(fields: [paymentMethodId], references: [id])
+  amount          Float
+  createdAt       DateTime      @default(now())
 }
 
 // --- GENERIC PAYMENTS (record one payment, allocate across multiple open sales invoices or purchase bills) ---
@@ -912,6 +1190,53 @@ model UnitOfMeasurement {
   createdAt    DateTime  @default(now())
 }
 
+// A customer's/supplier's default credit terms (e.g. "Net 30") — resolved onto Invoice/Bill at
+// creation time to compute a real dueDate, instead of AR/AP aging just counting from createdAt.
+model PaymentTerm {
+  id        Int       @id @default(autoincrement())
+  name      String // e.g. "Net 30", "Due on Receipt"
+  days      Int // 0 = due immediately
+  isActive  Boolean   @default(true)
+  isDefault Boolean   @default(false)
+  createdAt DateTime  @default(now())
+
+  customers Customer[]
+  suppliers Supplier[]
+  invoices  Invoice[]
+  bills     Bill[]
+}
+
+// A department/project cost bucket an admin can tag onto a manual journal line or an expense —
+// purely a reporting dimension on JournalLine, no effect on posting logic itself.
+model CostCenter {
+  id        Int      @id @default(autoincrement())
+  name      String
+  code      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  journalLines JournalLine[]
+  expenses     Expense[]
+}
+
+// A named accounting period (e.g. "FY2026") that can be LOCKED to freeze the ledger — once
+// locked, no new/voided journal entry may post with a date inside it. Ranges may not overlap
+// (enforced in the service, not the schema).
+enum FiscalYearStatus {
+  OPEN
+  LOCKED
+}
+
+model FiscalYear {
+  id        Int              @id @default(autoincrement())
+  name      String           @unique
+  startDate DateTime
+  endDate   DateTime
+  status    FiscalYearStatus @default(OPEN)
+  lockedAt  DateTime?
+  createdAt DateTime         @default(now())
+}
+
 // --- EXPENSES (separate from Purchase Bills — operating costs like rent, utilities, fuel) ---
 model ExpenseCategory {
   id        Int       @id @default(autoincrement())
@@ -934,6 +1259,10 @@ model Expense {
   description   String?
   amount        Float
   status        ExpenseStatus   @default(DRAFT)
+
+  // Tags the debit (expense) leg posted at approve() time — a pure reporting dimension.
+  costCenterId Int?
+  costCenter   CostCenter? @relation(fields: [costCenterId], references: [id])
 
   createdAt  DateTime  @default(now())
   approvedAt DateTime?
@@ -972,6 +1301,17 @@ model JournalLine {
   // Nullable so pre-existing journal lines (posted before this field existed) stay valid with no data loss.
   partyType PartyType?
   partyName String?
+
+  // Optional department/project tag — a pure reporting dimension, set by whoever posts the entry
+  // (manual journal entry, expense). Auto-posted lines (POS, invoices, payroll, ...) never set this.
+  costCenterId Int?
+  costCenter   CostCenter? @relation(fields: [costCenterId], references: [id])
+
+  // Optional outlet/branch dimension for Outlet P&L — set only on revenue/COGS lines auto-posted
+  // from a warehouse-scoped sale (POS, Sales Invoice, Delivery COGS/returns). Purchases, payroll,
+  // manual entries, and expenses never set this — those lines fall into the report's "Unassigned" bucket.
+  warehouseId Int?
+  warehouse   Warehouse? @relation(fields: [warehouseId], references: [id])
 
   journalEntryId Int
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
@@ -1025,6 +1365,9 @@ model PosSale {
   invoiceNumber  String? @unique
   totalAmount    Float   @default(0)
   discountAmount Float   @default(0)
+  taxId          Int?
+  tax            Tax?    @relation(fields: [taxId], references: [id])
+  taxAmount      Float   @default(0)
   clientName     String?
 
   // Optional link to the Customer directory — clientName stays the source of truth for
@@ -1044,6 +1387,7 @@ model PosSale {
   servedBy   PosStaff? @relation(fields: [servedById], references: [id])
 
   items PosSaleItem[]
+  payments PosSalePayment[]
 
   // Set when this sale is cancelled — restocks inventory and reverses the GL postings at the
   // same time (unlike the audit-only PosCancelledSale log, which just records that it happened).
@@ -1295,3 +1639,4 @@ model EosAccrualLog {
   journalEntryId Int?
   createdAt      DateTime @default(now())
 }
+

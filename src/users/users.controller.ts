@@ -21,6 +21,12 @@ export class UsersController {
     return this.usersService.getMerchandisers();
   }
 
+  // GET /users/all — every user regardless of role, for staff-assignment dropdowns
+  @Get('all')
+  getAll() {
+    return this.usersService.getAll();
+  }
+
   // 🔥 ROUTE: PATCH /users/merchandiser/:id — edit details and/or reset password
   @Roles('ADMIN')
   @Patch('merchandiser/:id')

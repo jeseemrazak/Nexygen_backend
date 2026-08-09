@@ -1,4 +1,4 @@
-import { IsInt, IsArray, ValidateNested, Min } from 'class-validator';
+import { IsInt, IsArray, IsOptional, ValidateNested, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 class InvoiceItemDto {
@@ -13,6 +13,18 @@ class InvoiceItemDto {
 export class CreateInvoiceDto {
   @IsInt()
   salesOrderId: number;
+
+  @IsInt()
+  @IsOptional()
+  taxId?: number;
+
+  @IsInt()
+  @IsOptional()
+  paymentTermId?: number;
+
+  @IsInt()
+  @IsOptional()
+  currencyId?: number;
 
   @IsArray()
   @ValidateNested({ each: true })

@@ -35,6 +35,55 @@ export class PartyPaymentsService {
     });
   }
 
+  // Every POS sale tendered (in whole or part) on account for one customer, with whatever's
+  // already been settled against it netted out. Direct analogue of getOpenInvoices(), reused
+  // by both the customer balance figure and the settle-credit dialog's document picker.
+  async getOpenAccountSales(customerId: number) {
+    const sales = await this.prisma.posSale.findMany({
+      where: {
+        customerId,
+        cancelledAt: null,
+        payments: { some: { paymentMethod: { type: 'ACCOUNT_RECEIVABLE' } } },
+      },
+      include: {
+        payments: { include: { paymentMethod: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const results = await Promise.all(
+      sales.map(async (sale) => {
+        // Split-tender sales may only put part of the total on account — only that portion is
+        // ever debited to AR (see PosSalesService.createInTx), so only that portion is owed here.
+        const arAmount = sale.payments
+          .filter((p: any) => p.paymentMethod.type === 'ACCOUNT_RECEIVABLE')
+          .reduce((s: number, p: any) => s + p.amount, 0);
+
+        const settled = await this.prisma.partyPaymentAllocation.aggregate({
+          where: { sourceType: 'POS_SALE', sourceId: sale.id },
+          _sum: { amountAllocated: true },
+        });
+        const outstanding = arAmount - (settled._sum.amountAllocated || 0);
+
+        return {
+          id: sale.id,
+          invoiceNumber: sale.invoiceNumber,
+          createdAt: sale.createdAt,
+          totalAmount: sale.totalAmount,
+          arAmount,
+          outstanding,
+        };
+      }),
+    );
+
+    return results.filter((r) => r.outstanding > 0.01);
+  }
+
+  async getCustomerBalance(customerId: number) {
+    const openSales = await this.getOpenAccountSales(customerId);
+    return { balance: openSales.reduce((s, r) => s + r.outstanding, 0) };
+  }
+
   // Unifies all three payment paths in this app into one list: the generic multi-document
   // PartyPayment (this module's own `create()`), plus the direct single-document payments
   // recorded straight from an Invoice or Bill's detail page (Payment/PurchasePayment) — those
@@ -208,6 +257,12 @@ export class PartyPaymentsService {
           const newPaid = Math.min(Math.max(invoice.amountPaid + alloc.amountAllocated, 0), invoice.totalAmount);
           const status = newPaid >= invoice.totalAmount ? 'PAID' : newPaid > 0 ? 'PARTIAL' : 'UNPAID';
           await tx.invoice.update({ where: { id: alloc.sourceId }, data: { amountPaid: newPaid, paymentStatus: status } });
+        } else if (alloc.sourceType === 'POS_SALE') {
+          // PosSale has no amountPaid/paymentStatus columns — "settled" is derived on read
+          // (getOpenAccountSales sums PartyPaymentAllocation rows), so settling a POS sale on
+          // account only needs the allocation row itself, no update to the sale.
+          const sale = await tx.posSale.findUnique({ where: { id: alloc.sourceId } });
+          if (!sale) throw new BadRequestException(`POS sale ${alloc.sourceId} not found`);
         } else {
           const bill = await tx.bill.findUnique({ where: { id: alloc.sourceId } });
           if (!bill) throw new BadRequestException(`Bill ${alloc.sourceId} not found`);

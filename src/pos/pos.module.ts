@@ -14,5 +14,6 @@ import { LoyaltyModule } from '../loyalty/loyalty.module';
   imports: [AccountingModule, NotificationsModule, LoyaltyModule],
   controllers: [PosStaffController, PosSessionsController, PosSalesController],
   providers: [PosStaffService, PosSessionsService, PosSalesService, PrismaService],
+  exports: [PosStaffService, PosSessionsService, PosSalesService],
 })
 export class PosModule {}

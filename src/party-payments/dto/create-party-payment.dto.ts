@@ -2,8 +2,8 @@ import { IsArray, IsIn, IsInt, IsNotEmpty, IsNumber, IsOptional, IsString, Min, 
 import { Type } from 'class-transformer';
 
 class AllocationDto {
-  @IsIn(['SALES_INVOICE', 'PURCHASE_INVOICE'])
-  sourceType: 'SALES_INVOICE' | 'PURCHASE_INVOICE';
+  @IsIn(['SALES_INVOICE', 'PURCHASE_INVOICE', 'POS_SALE'])
+  sourceType: 'SALES_INVOICE' | 'PURCHASE_INVOICE' | 'POS_SALE';
 
   @IsInt()
   sourceId: number;

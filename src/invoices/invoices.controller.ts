@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Body, Param, Query } from '@nestjs/common';
 import { InvoicesService } from './invoices.service';
 import { CreateInvoiceDto } from './dto/create-invoice.dto';
 import { RecordPaymentDto } from './dto/record-payment.dto';
@@ -28,5 +28,11 @@ export class InvoicesController {
   @Post(':id/payments')
   recordPayment(@Param('id') id: string, @Body() dto: RecordPaymentDto) {
     return this.service.recordPayment(+id, dto);
+  }
+
+  @Roles('ADMIN')
+  @Patch(':id/cancel')
+  cancel(@Param('id') id: string, @Body('reason') reason?: string) {
+    return this.service.cancel(+id, reason);
   }
 }

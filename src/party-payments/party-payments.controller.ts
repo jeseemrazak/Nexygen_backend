@@ -32,4 +32,14 @@ export class PartyPaymentsController {
   getOpenBills(@Query('supplierName') supplierName?: string) {
     return this.service.getOpenBills(supplierName);
   }
+
+  @Get('customer-balance/:customerId')
+  getCustomerBalance(@Param('customerId') customerId: string) {
+    return this.service.getCustomerBalance(+customerId);
+  }
+
+  @Get('open-account-sales/:customerId')
+  getOpenAccountSales(@Param('customerId') customerId: string) {
+    return this.service.getOpenAccountSales(+customerId);
+  }
 }

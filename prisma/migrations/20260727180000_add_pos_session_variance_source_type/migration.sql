@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "JournalSourceType" ADD VALUE IF NOT EXISTS 'POS_SESSION_VARIANCE';

@@ -72,12 +72,16 @@ export class JournalService {
         | 'EXPENSE_PAYMENT'
         | 'POS_SALE'
         | 'POS_SALE_COGS'
+        | 'POS_SESSION_VARIANCE'
         | 'SALES_DELIVERY_COGS'
+        | 'SALES_DELIVERY_RETURN'
+        | 'PURCHASE_RECEIPT_RETURN'
         | 'PAYROLL_RUN'
         | 'PAYROLL_DISBURSEMENT'
         | 'LOAN_ISSUANCE'
         | 'EOS_ACCRUAL'
-        | 'STOCK_ADJUSTMENT';
+        | 'STOCK_ADJUSTMENT'
+        | 'RESTAURANT_TIP';
       sourceId?: number;
       memo?: string;
       date?: Date;
@@ -89,6 +93,8 @@ export class JournalService {
         description?: string;
         partyType?: 'CUSTOMER' | 'SUPPLIER';
         partyName?: string;
+        costCenterId?: number;
+        warehouseId?: number;
       }[];
     },
   ) {
@@ -98,12 +104,15 @@ export class JournalService {
       throw new BadRequestException(`Journal entry is unbalanced: debits ${totalDebit} != credits ${totalCredit}`);
     }
 
+    const entryDate = params.date ?? new Date();
+    await this.assertFiscalYearOpen(tx, entryDate);
+
     return tx.journalEntry.create({
       data: {
         sourceType: params.sourceType,
         sourceId: params.sourceId,
         memo: params.memo,
-        date: params.date ?? new Date(),
+        date: entryDate,
         journalId: params.journalId,
         lines: {
           create: params.lines.map((l) => ({
@@ -113,11 +122,25 @@ export class JournalService {
             description: l.description,
             partyType: l.partyType,
             partyName: l.partyName,
+            costCenterId: l.costCenterId,
+            warehouseId: l.warehouseId,
           })),
         },
       },
       include: { lines: { include: { account: true } } },
     });
+  }
+
+  // Every posting path (auto-posted or manual, forward entry or void reversal) funnels through
+  // here or voidEntryInTx — one choke point means "no journal entry lands inside a locked fiscal
+  // year" holds everywhere, not just on the manual-entry form.
+  private async assertFiscalYearOpen(tx: any, date: Date) {
+    const lockedYear = await tx.fiscalYear.findFirst({
+      where: { status: 'LOCKED', startDate: { lte: date }, endDate: { gte: date } },
+    });
+    if (lockedYear) {
+      throw new BadRequestException(`Fiscal year "${lockedYear.name}" is locked — this date can no longer be posted to.`);
+    }
   }
 
   async createManualEntry(dto: CreateJournalEntryDto) {
@@ -183,12 +206,15 @@ export class JournalService {
       throw new BadRequestException(`Entry ${id} is itself a reversal entry and cannot be voided`);
     }
 
+    const reversalDate = new Date();
+    await this.assertFiscalYearOpen(tx, reversalDate);
+
     const reversal = await tx.journalEntry.create({
       data: {
         sourceType: original.sourceType,
         sourceId: original.sourceId,
         memo: reason ? `Void: ${reason} (reversal of entry #${original.id})` : `Reversal of entry #${original.id}`,
-        date: new Date(),
+        date: reversalDate,
         reversalOfId: original.id,
         lines: {
           create: original.lines.map((l: any) => ({
@@ -196,6 +222,10 @@ export class JournalService {
             debit: l.credit,
             credit: l.debit,
             description: l.description,
+            partyType: l.partyType,
+            partyName: l.partyName,
+            costCenterId: l.costCenterId,
+            warehouseId: l.warehouseId,
           })),
         },
       },
@@ -286,6 +316,64 @@ export class JournalService {
     return { incomeLines, expenseLines, totalIncome, totalExpense, netProfit: totalIncome - totalExpense };
   }
 
+  // Same INCOME/EXPENSE accounts as getProfitAndLoss, but broken out per Warehouse (the "outlet"
+  // dimension) using JournalLine.warehouseId — only POS sales, Sales Invoices, and Delivery
+  // COGS/returns ever set that column, so Purchases/Payroll/Manual/Expense lines (which never
+  // do) all land in a single "Unassigned" bucket rather than being silently dropped. Column
+  // totals always sum to exactly the same figures getProfitAndLoss returns for the same range.
+  async getOutletProfitAndLoss(from?: string, to?: string) {
+    const dateFilter: { gte?: Date; lte?: Date } = {};
+    if (from) dateFilter.gte = new Date(from);
+    if (to) dateFilter.lte = new Date(to + 'T23:59:59.999Z');
+    const hasFilter = Object.keys(dateFilter).length > 0;
+
+    const warehouses = await this.prisma.warehouse.findMany({ orderBy: { name: 'asc' } });
+    const incomeAccounts = await this.prisma.account.findMany({ where: { type: 'INCOME' }, orderBy: { code: 'asc' } });
+    const expenseAccounts = await this.prisma.account.findMany({ where: { type: 'EXPENSE' }, orderBy: { code: 'asc' } });
+
+    const buildRow = async (account: { id: number; code: string; name: string }, sign: 1 | -1) => {
+      const lines = await this.prisma.journalLine.groupBy({
+        by: ['warehouseId'],
+        where: { accountId: account.id, ...(hasFilter && { journalEntry: { date: dateFilter } }) },
+        _sum: { debit: true, credit: true },
+      });
+      const byWarehouseId: Record<string, number> = {};
+      let unassigned = 0;
+      for (const l of lines) {
+        // sign=1 (income, credit-normal): amount = credit - debit. sign=-1 (expense, debit-normal): amount = debit - credit.
+        const normalized = sign === 1 ? (l._sum.credit || 0) - (l._sum.debit || 0) : (l._sum.debit || 0) - (l._sum.credit || 0);
+        if (l.warehouseId === null) unassigned += normalized;
+        else byWarehouseId[l.warehouseId] = normalized;
+      }
+      const total = Object.values(byWarehouseId).reduce((s, v) => s + v, 0) + unassigned;
+      return { account, byWarehouseId, unassigned, total };
+    };
+
+    const incomeRows = await Promise.all(incomeAccounts.map((a) => buildRow(a, 1)));
+    const expenseRows = await Promise.all(expenseAccounts.map((a) => buildRow(a, -1)));
+
+    const sumColumn = (rows: typeof incomeRows, warehouseId: number | null) =>
+      rows.reduce((s, r) => s + (warehouseId === null ? r.unassigned : r.byWarehouseId[warehouseId] || 0), 0);
+
+    const columns = [...warehouses.map((w) => ({ id: w.id, name: w.name })), { id: null, name: 'Unassigned' }];
+    const netByColumn = columns.map((c) => ({
+      ...c,
+      income: sumColumn(incomeRows, c.id),
+      expense: sumColumn(expenseRows, c.id),
+      net: sumColumn(incomeRows, c.id) - sumColumn(expenseRows, c.id),
+    }));
+
+    return {
+      warehouses: columns,
+      incomeRows,
+      expenseRows,
+      netByColumn,
+      totalIncome: incomeRows.reduce((s, r) => s + r.total, 0),
+      totalExpense: expenseRows.reduce((s, r) => s + r.total, 0),
+      netProfit: incomeRows.reduce((s, r) => s + r.total, 0) - expenseRows.reduce((s, r) => s + r.total, 0),
+    };
+  }
+
   async getBalanceSheet(asOf?: string) {
     const dateFilter = asOf ? { lte: new Date(asOf + 'T23:59:59.999Z') } : undefined;
 
@@ -330,6 +418,94 @@ export class JournalService {
       totalAssets: assetLines.reduce((s, l) => s + l.amount, 0),
       totalLiabilities: liabilityLines.reduce((s, l) => s + l.amount, 0),
       totalEquity: equityLines.reduce((s, l) => s + l.amount, 0),
+    };
+  }
+
+  // Indirect-method Cash Flow Statement for [from, to]. Built entirely from balance-sheet-account
+  // deltas rather than a hand-maintained cash ledger, so it's guaranteed to reconcile: because
+  // getBalanceSheet() always folds in-progress net income as a synthetic Equity line, the
+  // accounting identity Assets = Liabilities + Equity holds at any two points in time, which
+  // algebraically forces (Operating + Investing + Financing) to equal the period's actual
+  // Cash+Bank movement — `reconciles` below is a live proof of that, not just a display figure.
+  async getCashFlowStatement(from: string, to: string) {
+    if (!from || !to) {
+      throw new BadRequestException('from and to dates are required for the Cash Flow Statement');
+    }
+    const openingAsOf = new Date(new Date(from).getTime() - 1);
+    const closingAsOf = new Date(to + 'T23:59:59.999Z');
+
+    const cashBankAccount = await this.getMappedAccount(AccountMappingRole.CASH_BANK);
+    const bankFixed = await this.prisma.account.findUnique({ where: { code: '1010' } });
+    const cashAccountIds = Array.from(new Set([cashBankAccount.id, ...(bankFixed ? [bankFixed.id] : [])]));
+
+    const { netProfit } = await this.getProfitAndLoss(from, to);
+
+    const assets = await this.prisma.account.findMany({ where: { type: 'ASSET' } });
+    const liabilities = await this.prisma.account.findMany({ where: { type: 'LIABILITY' } });
+    const equity = await this.prisma.account.findMany({ where: { type: 'EQUITY' } });
+
+    const balanceAt = async (accountId: number, debitNormal: boolean, asOf: Date) => {
+      const { debit, credit } = await this.sumForAccount(accountId, { lte: asOf });
+      return debitNormal ? debit - credit : credit - debit;
+    };
+
+    const buildLine = async (account: { id: number; code: string; name: string }, debitNormal: boolean, cashImpactSign: 1 | -1) => {
+      const opening = await balanceAt(account.id, debitNormal, openingAsOf);
+      const closing = await balanceAt(account.id, debitNormal, closingAsOf);
+      const change = closing - opening;
+      return { account, change, cashImpact: cashImpactSign * change };
+    };
+
+    // Operating: net income + working-capital changes (increase in a non-cash asset consumes
+    // cash; increase in a liability frees it up) — every current-ish ASSET/LIABILITY account
+    // except cash-equivalents and Fixed Assets (which is Investing, below).
+    const operatingLines = [
+      ...(await Promise.all(
+        assets
+          .filter((a) => !cashAccountIds.includes(a.id) && a.subtype !== 'Non-current Asset')
+          .map((a) => buildLine(a, true, -1)),
+      )),
+      ...(await Promise.all(liabilities.map((a) => buildLine(a, false, 1)))),
+    ];
+
+    // Investing: Fixed Assets (1500) — an increase is a cash outflow (equipment purchased).
+    const investingLines = await Promise.all(
+      assets.filter((a) => a.subtype === 'Non-current Asset' && !cashAccountIds.includes(a.id)).map((a) => buildLine(a, true, -1)),
+    );
+
+    // Financing: real Equity accounts (e.g. Owner's Equity) — the synthetic "Retained Earnings"
+    // line getBalanceSheet() adds isn't a real account (id: null) so it never appears here; its
+    // movement is exactly `netProfit`, already counted at the top of Operating.
+    const financingLines = await Promise.all(equity.map((a) => buildLine(a, false, 1)));
+
+    const netCashFromOperating = netProfit + operatingLines.reduce((s, l) => s + l.cashImpact, 0);
+    const netCashFromInvesting = investingLines.reduce((s, l) => s + l.cashImpact, 0);
+    const netCashFromFinancing = financingLines.reduce((s, l) => s + l.cashImpact, 0);
+    const netChangeInCash = netCashFromOperating + netCashFromInvesting + netCashFromFinancing;
+
+    let openingCash = 0;
+    let closingCash = 0;
+    for (const id of cashAccountIds) {
+      openingCash += await balanceAt(id, true, openingAsOf);
+      closingCash += await balanceAt(id, true, closingAsOf);
+    }
+    const actualCashMovement = closingCash - openingCash;
+
+    return {
+      from,
+      to,
+      netProfit,
+      operatingLines,
+      netCashFromOperating,
+      investingLines,
+      netCashFromInvesting,
+      financingLines,
+      netCashFromFinancing,
+      netChangeInCash,
+      openingCash,
+      closingCash,
+      actualCashMovement,
+      reconciles: Math.abs(netChangeInCash - actualCashMovement) < 0.01,
     };
   }
 

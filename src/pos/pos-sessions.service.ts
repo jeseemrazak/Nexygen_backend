@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { JournalService } from '../accounting/journal.service';
 import { PosStaffService } from './pos-staff.service';
 import { OpenSessionDto } from './dto/open-session.dto';
 import { CloseSessionDto } from './dto/close-session.dto';
@@ -16,6 +18,7 @@ export class PosSessionsService {
   constructor(
     private prisma: PrismaService,
     private posStaffService: PosStaffService,
+    private journalService: JournalService,
   ) {}
 
   // A session's sales are whatever falls inside its open/close time window. Cash reconciliation
@@ -34,7 +37,7 @@ export class PosSessionsService {
   }
 
   async close(id: number, dto: CloseSessionDto) {
-    const session = await this.prisma.posSession.findUnique({ where: { id } });
+    const session = await this.prisma.posSession.findUnique({ where: { id }, include: { warehouse: true } });
     if (!session) throw new NotFoundException(`Session ${id} not found`);
     if (session.status === 'CLOSED') throw new BadRequestException(`Session ${id} is already closed`);
 
@@ -49,6 +52,30 @@ export class PosSessionsService {
     const cashSalesTotal = cashSales.reduce((sum, s) => sum + s.totalAmount, 0);
     const expectedCash = (session.openingCash ?? 0) + cashSalesTotal;
     const cashVariance = dto.countedCash != null ? dto.countedCash - expectedCash : null;
+
+    // Post cash variance GL entries if a counted cash amount was provided and there's a variance
+    if (cashVariance != null && cashVariance !== 0) {
+      const variance = Math.abs(cashVariance);
+      const isGain = cashVariance > 0;
+      const role = isGain ? AccountMappingRole.CASH_DIFFERENCE_GAIN : AccountMappingRole.CASH_DIFFERENCE_LOSS;
+      const cashAccountId = await this.journalService.getMappedAccountId(this.prisma, AccountMappingRole.CASH_BANK);
+      const varianceAccountId = await this.journalService.getMappedAccountId(this.prisma, role);
+
+      await this.journalService.postEntry(this.prisma, {
+        sourceType: 'POS_SESSION_VARIANCE',
+        sourceId: id,
+        memo: `Cash variance for POS session #${id} (${session.warehouse.name})`,
+        lines: isGain
+          ? [
+              { accountId: cashAccountId, debit: variance }, // Cash increases (gain)
+              { accountId: varianceAccountId, credit: variance }, // Variance income
+            ]
+          : [
+              { accountId: varianceAccountId, debit: variance }, // Variance expense
+              { accountId: cashAccountId, credit: variance }, // Cash decreases (loss)
+            ],
+      });
+    }
 
     return this.prisma.posSession.update({
       where: { id },

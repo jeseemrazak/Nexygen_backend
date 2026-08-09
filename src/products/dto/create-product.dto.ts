@@ -39,6 +39,12 @@ export class CreateProductDto {
   @IsOptional()
   posActive?: boolean;
 
+  // Archiving (soft-deactivate) — distinct from posActive, which only hides a product from the
+  // POS checkout grid. isActive hides it everywhere (product list default view, pickers).
+  @IsBoolean()
+  @IsOptional()
+  isActive?: boolean;
+
   @IsInt()
   @IsOptional()
   categoryId?: number;

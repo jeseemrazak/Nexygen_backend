@@ -20,6 +20,18 @@ export class CreateBillDto {
   @IsInt()
   purchaseOrderId: number;
 
+  @IsInt()
+  @IsOptional()
+  taxId?: number;
+
+  @IsInt()
+  @IsOptional()
+  paymentTermId?: number;
+
+  @IsInt()
+  @IsOptional()
+  currencyId?: number;
+
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => BillItemDto)

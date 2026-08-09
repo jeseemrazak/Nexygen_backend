@@ -22,6 +22,11 @@ const ROLE_META: Record<AccountMappingRole, { label: string; description: string
   SALARY_PAYABLE: { label: 'Salary Payable', description: 'Net pay owed to staff until disbursed', group: 'Payroll' },
   EOS_GRATUITY_EXPENSE: { label: 'EOS Gratuity Expense', description: 'Monthly end-of-service gratuity accrual cost', group: 'Payroll' },
   EOS_GRATUITY_ACCRUAL: { label: 'EOS Gratuity Accrual', description: 'Accumulated end-of-service gratuity liability', group: 'Payroll' },
+  TIPS_PAYABLE: { label: 'Tips Payable', description: 'Tips collected on restaurant tabs, owed out to staff', group: 'Sales' },
+  CASH_DIFFERENCE_GAIN: { label: 'Cash Difference Gain', description: 'Gain recognized when actual cash counted exceeds expected amount at register close', group: 'Cash & Parties' },
+  CASH_DIFFERENCE_LOSS: { label: 'Cash Difference Loss', description: 'Loss recognized when actual cash counted is less than expected amount at register close', group: 'Cash & Parties' },
+  TAX_PAYABLE: { label: 'Tax Payable (Output)', description: 'Tax collected on sales invoices and POS sales, owed to the tax authority', group: 'Sales' },
+  TAX_RECEIVABLE: { label: 'Tax Receivable (Input)', description: 'Recoverable tax paid on supplier bills', group: 'Inventory & COGS' },
 };
 
 @Injectable()

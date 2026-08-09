@@ -9,6 +9,7 @@ const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   payments: { orderBy: { paidAt: 'desc' as const } },
   purchaseOrder: { include: { warehouse: true, supplier: true } },
+  currency: true,
 };
 
 @Injectable()
@@ -30,7 +31,7 @@ export class BillsService {
       throw new BadRequestException(`Purchase Order ${dto.purchaseOrderId} must be ORDERED before it can be billed (status: ${po.status})`);
     }
 
-    let totalAmount = 0;
+    let subtotal = 0;
     for (const reqItem of dto.items) {
       const poItem = po.items.find((i) => i.id === reqItem.purchaseOrderItemId);
       if (!poItem) {
@@ -40,12 +41,40 @@ export class BillsService {
       if (reqItem.quantity > remaining) {
         throw new BadRequestException(`Cannot bill ${reqItem.quantity} for item ${reqItem.purchaseOrderItemId}; only ${remaining} remaining`);
       }
-      totalAmount += reqItem.quantity * (reqItem.unitCost ?? poItem.unitCost);
+      subtotal += reqItem.quantity * (reqItem.unitCost ?? poItem.unitCost);
     }
 
     return this.prisma.$transaction(async (tx) => {
+      let taxAmount = 0;
+      if (dto.taxId) {
+        const tax = await tx.tax.findUnique({ where: { id: dto.taxId } });
+        if (!tax) throw new BadRequestException(`Tax ${dto.taxId} not found`);
+        taxAmount = Math.round(subtotal * (tax.rate / 100) * 100) / 100;
+      }
+      const totalAmount = subtotal + taxAmount;
+
+      const effectiveTermId = dto.paymentTermId ?? po.supplier.paymentTermId ?? undefined;
+      let dueDate: Date | undefined;
+      if (effectiveTermId) {
+        const term = await tx.paymentTerm.findUnique({ where: { id: effectiveTermId } });
+        if (!term) throw new BadRequestException(`Payment term ${effectiveTermId} not found`);
+        dueDate = new Date(Date.now() + term.days * 86400000);
+      }
+
+      // Foreign-currency quote, frozen at creation time — see Invoice's identical handling.
+      let currencyFields: { currencyId?: number; exchangeRate?: number; foreignTotalAmount?: number } = {};
+      if (dto.currencyId) {
+        const currency = await tx.currency.findUnique({ where: { id: dto.currencyId } });
+        if (!currency) throw new BadRequestException(`Currency ${dto.currencyId} not found`);
+        currencyFields = {
+          currencyId: currency.id,
+          exchangeRate: currency.exchangeRateToBase,
+          foreignTotalAmount: Math.round((totalAmount / currency.exchangeRateToBase) * 100) / 100,
+        };
+      }
+
       const bill = await tx.bill.create({
-        data: { purchaseOrderId: dto.purchaseOrderId, totalAmount },
+        data: { purchaseOrderId: dto.purchaseOrderId, subtotal, taxId: dto.taxId, taxAmount, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
       });
       await tx.bill.update({
         where: { id: bill.id },
@@ -75,21 +104,25 @@ export class BillsService {
         }
       }
 
-      // 💰 Auto-post: Dr Stock Interim (Received) / Cr Accounts Payable — converts the
-      // accrued-but-unbilled liability into a real, billed one owed to the supplier.
+      // 💰 Auto-post: Dr Stock Interim (Received) + Dr Tax Receivable (if any) / Cr Accounts
+      // Payable — converts the accrued-but-unbilled liability into a real, billed one owed to
+      // the supplier, and recognizes any recoverable input tax on the bill.
       if (totalAmount > 0) {
-        const [stockInterimAccountId, apAccountId] = await Promise.all([
+        const [stockInterimAccountId, apAccountId, taxReceivableAccountId] = await Promise.all([
           this.journalService.getMappedAccountId(tx, AccountMappingRole.STOCK_INTERIM),
           this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_PAYABLE),
+          taxAmount > 0 ? this.journalService.getMappedAccountId(tx, AccountMappingRole.TAX_RECEIVABLE) : Promise.resolve(null),
         ]);
+        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'SUPPLIER'; partyName?: string }[] = [
+          { accountId: stockInterimAccountId, debit: subtotal },
+        ];
+        if (taxAmount > 0) lines.push({ accountId: taxReceivableAccountId!, debit: taxAmount });
+        lines.push({ accountId: apAccountId, credit: totalAmount, partyType: 'SUPPLIER', partyName: po.supplier.name });
         await this.journalService.postEntry(tx, {
           sourceType: 'PURCHASE_INVOICE',
           sourceId: bill.id,
           memo: `Bill for PO #${dto.purchaseOrderId}`,
-          lines: [
-            { accountId: stockInterimAccountId, debit: totalAmount },
-            { accountId: apAccountId, credit: totalAmount, partyType: 'SUPPLIER', partyName: po.supplier.name },
-          ],
+          lines,
         });
       }
 
@@ -109,6 +142,37 @@ export class BillsService {
     const bill = await this.prisma.bill.findUnique({ where: { id }, include: DETAIL_INCLUDE });
     if (!bill) throw new NotFoundException(`Bill ${id} not found`);
     return bill;
+  }
+
+  async cancel(id: number, reason?: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const bill = await tx.bill.findUnique({ where: { id }, include: { items: true } });
+      if (!bill) throw new NotFoundException(`Bill ${id} not found`);
+      if (bill.cancelledAt) throw new BadRequestException(`Bill ${id} is already cancelled`);
+      if (bill.amountPaid > 0) {
+        throw new BadRequestException(`Cannot cancel Bill ${id} — it has payments recorded against it; reverse the payments first`);
+      }
+
+      const entries = await tx.journalEntry.findMany({
+        where: { sourceType: { in: ['PURCHASE_INVOICE', 'PURCHASE_PAYMENT'] }, sourceId: id, voidedAt: null, reversalOfId: null },
+      });
+      for (const entry of entries) {
+        await this.journalService.voidEntryInTx(tx, entry.id, reason);
+      }
+
+      for (const item of bill.items) {
+        await tx.purchaseOrderItem.update({
+          where: { id: item.purchaseOrderItemId },
+          data: { quantityBilled: { decrement: item.quantity } },
+        });
+      }
+
+      return tx.bill.update({
+        where: { id },
+        data: { cancelledAt: new Date() },
+        include: DETAIL_INCLUDE,
+      });
+    }, { timeout: 15000 });
   }
 
   async recordPayment(billId: number, dto: RecordBillPaymentDto) {

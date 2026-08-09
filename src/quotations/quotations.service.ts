@@ -4,6 +4,7 @@ import { SalesOrdersService } from '../sales-orders/sales-orders.service';
 import { CreateQuotationDto } from './dto/create-quotation.dto';
 import { UpdateQuotationStatusDto } from './dto/update-quotation-status.dto';
 import { applyDiscount } from '../common/discount.util';
+import { computeTaxAmount } from '../common/tax.util';
 
 @Injectable()
 export class QuotationsService {
@@ -21,7 +22,9 @@ export class QuotationsService {
       return { ...i, listPrice: i.listPrice ?? null, price };
     });
     const subtotal = items.reduce((sum, i) => sum + i.quantity * i.price, 0);
-    const totalAmount = applyDiscount(subtotal, dto.discountType, dto.discountValue);
+    const netAfterDiscount = applyDiscount(subtotal, dto.discountType, dto.discountValue);
+    const taxAmount = await computeTaxAmount(this.prisma, dto.taxId, netAfterDiscount);
+    const totalAmount = netAfterDiscount + taxAmount;
 
     let clientName = dto.clientName;
     if (dto.customerId) {
@@ -39,6 +42,8 @@ export class QuotationsService {
         termsAndConditions: dto.termsAndConditions,
         discountType: dto.discountType,
         discountValue: dto.discountValue ?? 0,
+        taxId: dto.taxId,
+        taxAmount,
         validUntil: dto.validUntil ? new Date(dto.validUntil) : undefined,
         subtotal,
         totalAmount,
@@ -108,6 +113,8 @@ export class QuotationsService {
       termsAndConditions: quotation.termsAndConditions ?? undefined,
       discountType: quotation.discountType as 'PERCENT' | 'AMOUNT' | null,
       discountValue: quotation.discountValue,
+      taxId: quotation.taxId,
+      taxAmount: quotation.taxAmount,
       subtotal: quotation.subtotal,
       items: quotation.items.map((i) => ({
         productId: i.productId,

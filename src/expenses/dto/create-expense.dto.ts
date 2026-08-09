@@ -15,4 +15,8 @@ export class CreateExpenseDto {
   @IsNumber()
   @Min(0.01)
   amount: number;
+
+  @IsInt()
+  @IsOptional()
+  costCenterId?: number;
 }

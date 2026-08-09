@@ -3,10 +3,12 @@ import { AccountMappingRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JournalService } from '../accounting/journal.service';
 import { CreateReceiptDto } from './dto/create-receipt.dto';
+import { ReturnReceiptDto } from './dto/return-receipt.dto';
 
 const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   purchaseOrder: { include: { warehouse: true, supplier: true } },
+  returns: { include: { items: true }, orderBy: { createdAt: 'desc' as const } },
 };
 
 @Injectable()
@@ -149,6 +151,113 @@ export class ReceiptsService {
       }
 
       return tx.receipt.findUnique({ where: { id: receipt.id }, include: DETAIL_INCLUDE });
+    }, { timeout: 15000 });
+  }
+
+  // De-stocks goods being returned to the supplier and posts a fresh Dr Stock Interim /
+  // Cr Inventory entry sized to just the returned portion — mirrors DeliveryReturn's "new
+  // entry, not a void" reasoning, since the original receipt entry covers the whole receipt.
+  // Guarded so a batch can't be over-returned past what's still physically on hand (some of it
+  // may have already been sold/delivered out of that batch since it was received).
+  async returnItems(receiptId: number, dto: ReturnReceiptDto) {
+    return this.prisma.$transaction(async (tx) => {
+      const receipt = await tx.receipt.findUnique({
+        where: { id: receiptId },
+        include: { items: true, purchaseOrder: { include: { supplier: true } } },
+      });
+      if (!receipt) throw new NotFoundException(`Receipt ${receiptId} not found`);
+
+      let totalValue = 0;
+      const receiptReturn = await tx.receiptReturn.create({
+        data: { receiptId, reason: dto.reason },
+      });
+
+      for (const reqItem of dto.items) {
+        const receiptItem = receipt.items.find((i) => i.id === reqItem.receiptItemId);
+        if (!receiptItem) {
+          throw new BadRequestException(`Item ${reqItem.receiptItemId} is not part of Receipt #${receiptId}`);
+        }
+
+        const { _sum } = await tx.receiptReturnItem.aggregate({
+          where: { receiptItemId: receiptItem.id },
+          _sum: { quantity: true },
+        });
+        const alreadyReturned = _sum.quantity || 0;
+        const remaining = receiptItem.quantity - alreadyReturned;
+        if (reqItem.quantity > remaining) {
+          throw new BadRequestException(`Cannot return ${reqItem.quantity} for item ${receiptItem.id}; only ${remaining} remaining`);
+        }
+
+        const inv = await tx.inventory.findUnique({
+          where: {
+            productId_warehouseId_batchNumber: {
+              productId: receiptItem.productId,
+              warehouseId: receipt.purchaseOrder.warehouseId,
+              batchNumber: receiptItem.batchNumber,
+            },
+          },
+        });
+        const unitCost = inv && inv.unitCost > 0 ? inv.unitCost : 0;
+
+        // Atomic conditional decrement — can't return more than is currently on hand for
+        // that batch (some may have already shipped out via Delivery since it was received).
+        const deducted = await tx.inventory.updateMany({
+          where: {
+            productId: receiptItem.productId,
+            warehouseId: receipt.purchaseOrder.warehouseId,
+            batchNumber: receiptItem.batchNumber,
+            quantity: { gte: reqItem.quantity },
+          },
+          data: { quantity: { decrement: reqItem.quantity } },
+        });
+        if (deducted.count === 0) {
+          throw new BadRequestException(`Insufficient stock on hand for Product #${receiptItem.productId} (Batch: ${receiptItem.batchNumber}) to return ${reqItem.quantity}.`);
+        }
+
+        await tx.receiptReturnItem.create({
+          data: { receiptReturnId: receiptReturn.id, receiptItemId: receiptItem.id, quantity: reqItem.quantity },
+        });
+
+        await tx.stockMovement.create({
+          data: {
+            productId: receiptItem.productId,
+            batchNumber: receiptItem.batchNumber,
+            fromWarehouseId: receipt.purchaseOrder.warehouseId,
+            quantity: reqItem.quantity,
+            type: 'RETURN_TO_SUPPLIER',
+            reason: `Returned against Receipt #${receiptId}${dto.reason ? ` (${dto.reason})` : ''}`,
+          },
+        });
+
+        await tx.purchaseOrderItem.update({
+          where: { id: receiptItem.purchaseOrderItemId },
+          data: { quantityReceived: { decrement: reqItem.quantity } },
+        });
+
+        totalValue += reqItem.quantity * unitCost;
+      }
+
+      if (receipt.purchaseOrder.status === 'RECEIVED') {
+        await tx.purchaseOrder.update({ where: { id: receipt.purchaseOrderId }, data: { status: 'ORDERED' } });
+      }
+
+      if (totalValue > 0) {
+        const [inventoryAccountId, stockInterimAccountId] = await Promise.all([
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.INVENTORY),
+          this.journalService.getMappedAccountId(tx, AccountMappingRole.STOCK_INTERIM),
+        ]);
+        await this.journalService.postEntry(tx, {
+          sourceType: 'PURCHASE_RECEIPT_RETURN',
+          sourceId: receiptReturn.id,
+          memo: `Return to supplier against Receipt #${receiptId}${dto.reason ? ` (${dto.reason})` : ''}`,
+          lines: [
+            { accountId: stockInterimAccountId, debit: totalValue, partyType: 'SUPPLIER', partyName: receipt.purchaseOrder.supplier.name },
+            { accountId: inventoryAccountId, credit: totalValue },
+          ],
+        });
+      }
+
+      return tx.receipt.findUnique({ where: { id: receiptId }, include: DETAIL_INCLUDE });
     }, { timeout: 15000 });
   }
 

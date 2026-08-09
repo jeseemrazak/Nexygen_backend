@@ -31,4 +31,7 @@ export class UpdateCompanySettingsDto {
   @IsBoolean() @IsOptional() posAutoPrintReceipt?: boolean;
   @IsNumber() @IsOptional() posMaxDiscountPercent?: number;
   @IsBoolean() @IsOptional() posRequireCashCount?: boolean;
+
+  @IsBoolean() @IsOptional() kotAutoPrint?: boolean;
+  @IsString() @IsOptional() kotFooterText?: string;
 }

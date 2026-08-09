@@ -59,6 +59,10 @@ export class CreateSalesOrderDto {
   @IsOptional()
   discountValue?: number;
 
+  @IsInt()
+  @IsOptional()
+  taxId?: number;
+
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => SalesOrderItemDto)

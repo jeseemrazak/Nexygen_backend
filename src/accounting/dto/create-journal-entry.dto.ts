@@ -18,6 +18,10 @@ class JournalLineDto {
   @IsString()
   @IsOptional()
   description?: string;
+
+  @IsInt()
+  @IsOptional()
+  costCenterId?: number;
 }
 
 export class CreateJournalEntryDto {

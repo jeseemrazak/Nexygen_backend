@@ -33,5 +33,6 @@ import { AccountingModule } from '../accounting/accounting.module';
     EosGratuityService,
     PrismaService,
   ],
+  exports: [EmployeesService],
 })
 export class PayrollModule {}

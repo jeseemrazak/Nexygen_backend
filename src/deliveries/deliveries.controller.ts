@@ -1,7 +1,9 @@
 import { Controller, Get, Post, Patch, Body, Param, Query } from '@nestjs/common';
 import { DeliveriesService } from './deliveries.service';
 import { CreateDeliveryDto } from './dto/create-delivery.dto';
+import { ReturnDeliveryDto } from './dto/return-delivery.dto';
 import { DeliveryStatus } from '@prisma/client';
+import { Roles } from '../auth/roles.decorator';
 
 @Controller('deliveries')
 export class DeliveriesController {
@@ -25,5 +27,11 @@ export class DeliveriesController {
   @Patch(':id/status')
   updateStatus(@Param('id') id: string, @Body('status') status: DeliveryStatus) {
     return this.service.updateStatus(+id, status);
+  }
+
+  @Roles('ADMIN')
+  @Post(':id/returns')
+  returnItems(@Param('id') id: string, @Body() dto: ReturnDeliveryDto) {
+    return this.service.returnItems(+id, dto);
   }
 }

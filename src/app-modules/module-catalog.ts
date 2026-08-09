@@ -94,6 +94,33 @@ export const MODULE_CATALOG: ModuleCatalogEntry[] = [
       { key: 'requireTechnician', label: 'Require a technician to be assigned before starting work', type: 'boolean' },
     ],
   },
+  {
+    key: 'crm-leads',
+    name: 'CRM',
+    description: 'A prospecting pipeline separate from your paying-customer directory — track leads through New → Contacted → Qualified → Won/Lost and convert a won lead into a real Customer.',
+    category: 'Sales & CRM',
+    icon: '📇',
+    version: '1.0.0',
+    configFields: [],
+  },
+  {
+    key: 'appointments',
+    name: 'Appointments',
+    description: 'Schedule meetings, site visits, and calls against a Customer or Lead — assign staff, track Scheduled/Completed/Cancelled/No-show status, list and calendar views.',
+    category: 'Sales & CRM',
+    icon: '📅',
+    version: '1.0.0',
+    configFields: [],
+  },
+  {
+    key: 'todo-list',
+    name: 'Todo List',
+    description: 'A shared, assignable task board — title, description, due date, priority, and status, assignable to any user.',
+    category: 'Productivity',
+    icon: '✅',
+    version: '1.0.0',
+    configFields: [],
+  },
 ];
 
 export function findCatalogEntry(key: string): ModuleCatalogEntry | undefined {

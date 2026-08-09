@@ -16,7 +16,7 @@ export class ExpensesService {
     if (status && status !== 'ALL') where.status = status;
     return this.prisma.expense.findMany({
       where,
-      include: { category: { include: { account: true } } },
+      include: { category: { include: { account: true } }, costCenter: true },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -24,7 +24,7 @@ export class ExpensesService {
   async findOne(id: number) {
     const expense = await this.prisma.expense.findUnique({
       where: { id },
-      include: { category: { include: { account: true } } },
+      include: { category: { include: { account: true } }, costCenter: true },
     });
     if (!expense) throw new NotFoundException(`Expense ${id} not found`);
     return expense;
@@ -35,12 +35,12 @@ export class ExpensesService {
       // expenseNumber starts null (not a placeholder string) so a concurrent create can never
       // collide on the unique constraint before either row gets its real, id-based number.
       const expense = await tx.expense.create({
-        data: { categoryId: dto.categoryId, payeeName: dto.payeeName, description: dto.description, amount: dto.amount },
+        data: { categoryId: dto.categoryId, payeeName: dto.payeeName, description: dto.description, amount: dto.amount, costCenterId: dto.costCenterId },
       });
       return tx.expense.update({
         where: { id: expense.id },
         data: { expenseNumber: `EXP-${String(expense.id).padStart(6, '0')}` },
-        include: { category: { include: { account: true } } },
+        include: { category: { include: { account: true } }, costCenter: true },
       });
     });
   }
@@ -87,7 +87,7 @@ export class ExpensesService {
         sourceId: id,
         memo: `Expense ${expense.expenseNumber} — ${expense.payeeName}`,
         lines: [
-          { accountId: expense.category.accountId, debit: expense.amount, description: expense.description || undefined },
+          { accountId: expense.category.accountId, debit: expense.amount, description: expense.description || undefined, costCenterId: expense.costCenterId ?? undefined },
           { accountId: payableAccountId, credit: expense.amount },
         ],
       });

@@ -32,6 +32,15 @@ export class UsersService {
     });
   }
 
+  // Every user regardless of role — backs staff-assignment dropdowns (CRM Leads/Appointments,
+  // Tasks) where an ADMIN office user is just as valid an assignee as a MERCHANDISER.
+  async getAll() {
+    return this.prisma.user.findMany({
+      select: { id: true, name: true, email: true, role: true },
+      orderBy: { name: 'asc' },
+    });
+  }
+
   // 🔥 2. Get all Merchandisers for the dashboard list
   async getMerchandisers() {
     return this.prisma.user.findMany({

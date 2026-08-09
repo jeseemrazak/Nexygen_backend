@@ -14,6 +14,7 @@ const DEFAULT_ACCOUNTS: { code: string; name: string; type: 'ASSET' | 'LIABILITY
   { code: '1100', name: 'Accounts Receivable', type: 'ASSET', subtype: 'Current Asset' },
   { code: '1200', name: 'Inventory', type: 'ASSET', subtype: 'Current Asset' },
   { code: '1300', name: 'Employee Advances Receivable', type: 'ASSET', subtype: 'Current Asset' },
+  { code: '1350', name: 'Tax Receivable (Input)', type: 'ASSET', subtype: 'Current Asset' },
   { code: '1400', name: 'Prepaid Expenses', type: 'ASSET', subtype: 'Current Asset' },
   { code: '1500', name: 'Fixed Assets', type: 'ASSET', subtype: 'Non-current Asset' },
   { code: '2000', name: 'Accounts Payable', type: 'LIABILITY', subtype: 'Current Liability' },
@@ -22,6 +23,8 @@ const DEFAULT_ACCOUNTS: { code: string; name: string; type: 'ASSET' | 'LIABILITY
   { code: '2200', name: 'Salary Payable', type: 'LIABILITY', subtype: 'Current Liability' },
   { code: '2210', name: 'GRSIA Payable', type: 'LIABILITY', subtype: 'Current Liability' },
   { code: '2220', name: 'End of Service Gratuity Accrual', type: 'LIABILITY', subtype: 'Long-term Liability' },
+  { code: '2230', name: 'Tips Payable', type: 'LIABILITY', subtype: 'Current Liability' },
+  { code: '2240', name: 'Tax Payable (Output)', type: 'LIABILITY', subtype: 'Current Liability' },
   { code: '2300', name: 'Employee Payable (Commissions/Reimbursements)', type: 'LIABILITY', subtype: 'Current Liability' },
   { code: '3000', name: "Owner's Equity", type: 'EQUITY' },
   { code: '4000', name: 'Sales Revenue', type: 'INCOME' },
@@ -53,6 +56,11 @@ const DEFAULT_ROLE_ACCOUNTS: Record<AccountMappingRole, string> = {
   SALARY_PAYABLE: '2200',
   EOS_GRATUITY_EXPENSE: '5220',
   EOS_GRATUITY_ACCRUAL: '2220',
+  TIPS_PAYABLE: '2230',
+  CASH_DIFFERENCE_GAIN: '5950',
+  CASH_DIFFERENCE_LOSS: '5960',
+  TAX_PAYABLE: '2240',
+  TAX_RECEIVABLE: '1350',
 };
 
 @Injectable()
@@ -139,23 +147,42 @@ export class AccountsService {
     return this.findAll();
   }
 
-  async getLedger(id: number) {
+  // "Account Inquiry" — every posting to one account, with a running balance. `from`/`to` scope
+  // which lines are actually listed; everything posted before `from` is folded into a single
+  // opening balance instead of silently vanishing, so the running balance column stays meaningful.
+  async getLedger(id: number, from?: string, to?: string) {
     const account = await this.prisma.account.findUnique({ where: { id } });
     if (!account) throw new NotFoundException(`Account ${id} not found`);
 
+    const isDebitNormal = account.type === 'ASSET' || account.type === 'EXPENSE';
+
+    let openingBalance = 0;
+    if (from) {
+      const { _sum } = await this.prisma.journalLine.aggregate({
+        where: { accountId: id, journalEntry: { date: { lt: new Date(from) } } },
+        _sum: { debit: true, credit: true },
+      });
+      const debit = _sum.debit || 0;
+      const credit = _sum.credit || 0;
+      openingBalance = isDebitNormal ? debit - credit : credit - debit;
+    }
+
+    const dateFilter: { gte?: Date; lte?: Date } = {};
+    if (from) dateFilter.gte = new Date(from);
+    if (to) dateFilter.lte = new Date(to + 'T23:59:59.999Z');
+
     const lines = await this.prisma.journalLine.findMany({
-      where: { accountId: id },
+      where: { accountId: id, ...(Object.keys(dateFilter).length > 0 && { journalEntry: { date: dateFilter } }) },
       include: { journalEntry: true },
       orderBy: { journalEntry: { date: 'asc' } },
     });
 
-    const isDebitNormal = account.type === 'ASSET' || account.type === 'EXPENSE';
-    let runningBalance = 0;
+    let runningBalance = openingBalance;
     const rows = lines.map((line) => {
       runningBalance += isDebitNormal ? line.debit - line.credit : line.credit - line.debit;
       return { ...line, runningBalance };
     });
 
-    return { account, lines: rows, endingBalance: runningBalance };
+    return { account, openingBalance, lines: rows, endingBalance: runningBalance };
   }
 }

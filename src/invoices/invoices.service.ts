@@ -9,6 +9,7 @@ const DETAIL_INCLUDE = {
   items: { include: { product: true } },
   payments: { orderBy: { receivedAt: 'desc' as const } },
   salesOrder: { include: { warehouse: true, user: { select: { name: true, email: true } } } },
+  currency: true,
 };
 
 @Injectable()
@@ -23,14 +24,14 @@ export class InvoicesService {
   async create(dto: CreateInvoiceDto) {
     const order = await this.prisma.salesOrder.findUnique({
       where: { id: dto.salesOrderId },
-      include: { items: true },
+      include: { items: true, customer: true },
     });
     if (!order) throw new NotFoundException(`Sales Order ${dto.salesOrderId} not found`);
     if (order.status !== 'CONFIRMED' && order.status !== 'DONE') {
       throw new BadRequestException(`Sales Order ${dto.salesOrderId} must be CONFIRMED before it can be invoiced (status: ${order.status})`);
     }
 
-    let totalAmount = 0;
+    let subtotal = 0;
     for (const reqItem of dto.items) {
       const soItem = order.items.find((i) => i.id === reqItem.salesOrderItemId);
       if (!soItem) {
@@ -40,12 +41,43 @@ export class InvoicesService {
       if (reqItem.quantity > remaining) {
         throw new BadRequestException(`Cannot invoice ${reqItem.quantity} for item ${reqItem.salesOrderItemId}; only ${remaining} remaining`);
       }
-      totalAmount += reqItem.quantity * soItem.price;
+      subtotal += reqItem.quantity * soItem.price;
     }
 
     return this.prisma.$transaction(async (tx) => {
+      let taxAmount = 0;
+      if (dto.taxId) {
+        const tax = await tx.tax.findUnique({ where: { id: dto.taxId } });
+        if (!tax) throw new BadRequestException(`Tax ${dto.taxId} not found`);
+        taxAmount = Math.round(subtotal * (tax.rate / 100) * 100) / 100;
+      }
+      const totalAmount = subtotal + taxAmount;
+
+      // Falls back to the customer's own default terms if none was given explicitly — dueDate is
+      // a frozen snapshot computed now, never recalculated if the term is edited later.
+      const effectiveTermId = dto.paymentTermId ?? order.customer?.paymentTermId ?? undefined;
+      let dueDate: Date | undefined;
+      if (effectiveTermId) {
+        const term = await tx.paymentTerm.findUnique({ where: { id: effectiveTermId } });
+        if (!term) throw new BadRequestException(`Payment term ${effectiveTermId} not found`);
+        dueDate = new Date(Date.now() + term.days * 86400000);
+      }
+
+      // Foreign-currency quote, frozen at creation time — a pure informational overlay on top of
+      // the real QAR totalAmount above (see the schema comment on Invoice.currencyId).
+      let currencyFields: { currencyId?: number; exchangeRate?: number; foreignTotalAmount?: number } = {};
+      if (dto.currencyId) {
+        const currency = await tx.currency.findUnique({ where: { id: dto.currencyId } });
+        if (!currency) throw new BadRequestException(`Currency ${dto.currencyId} not found`);
+        currencyFields = {
+          currencyId: currency.id,
+          exchangeRate: currency.exchangeRateToBase,
+          foreignTotalAmount: Math.round((totalAmount / currency.exchangeRateToBase) * 100) / 100,
+        };
+      }
+
       const invoice = await tx.invoice.create({
-        data: { salesOrderId: dto.salesOrderId, totalAmount },
+        data: { salesOrderId: dto.salesOrderId, subtotal, taxId: dto.taxId, taxAmount, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
       });
       await tx.invoice.update({
         where: { id: invoice.id },
@@ -76,18 +108,21 @@ export class InvoicesService {
       }
 
       if (totalAmount > 0) {
-        const [arAccountId, revenueAccountId] = await Promise.all([
+        const [arAccountId, revenueAccountId, taxPayableAccountId] = await Promise.all([
           this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_RECEIVABLE),
           this.journalService.getMappedAccountId(tx, AccountMappingRole.SALES_REVENUE),
+          taxAmount > 0 ? this.journalService.getMappedAccountId(tx, AccountMappingRole.TAX_PAYABLE) : Promise.resolve(null),
         ]);
+        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'CUSTOMER'; partyName?: string; warehouseId?: number }[] = [
+          { accountId: arAccountId, debit: totalAmount, partyType: 'CUSTOMER', partyName: order.clientName || 'Walk-in', warehouseId: order.warehouseId },
+          { accountId: revenueAccountId, credit: subtotal, warehouseId: order.warehouseId },
+        ];
+        if (taxAmount > 0) lines.push({ accountId: taxPayableAccountId!, credit: taxAmount, warehouseId: order.warehouseId });
         await this.journalService.postEntry(tx, {
           sourceType: 'SALES_INVOICE',
           sourceId: invoice.id,
           memo: `Sales invoice for Order #${dto.salesOrderId}`,
-          lines: [
-            { accountId: arAccountId, debit: totalAmount, partyType: 'CUSTOMER', partyName: order.clientName || 'Walk-in' },
-            { accountId: revenueAccountId, credit: totalAmount },
-          ],
+          lines,
         });
       }
 
@@ -107,6 +142,37 @@ export class InvoicesService {
     const invoice = await this.prisma.invoice.findUnique({ where: { id }, include: DETAIL_INCLUDE });
     if (!invoice) throw new NotFoundException(`Invoice ${id} not found`);
     return invoice;
+  }
+
+  async cancel(id: number, reason?: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const invoice = await tx.invoice.findUnique({ where: { id }, include: { items: true } });
+      if (!invoice) throw new NotFoundException(`Invoice ${id} not found`);
+      if (invoice.cancelledAt) throw new BadRequestException(`Invoice ${id} is already cancelled`);
+      if (invoice.amountPaid > 0) {
+        throw new BadRequestException(`Cannot cancel Invoice ${id} — it has payments recorded against it; reverse the payments first`);
+      }
+
+      const entries = await tx.journalEntry.findMany({
+        where: { sourceType: { in: ['SALES_INVOICE', 'SALES_PAYMENT'] }, sourceId: id, voidedAt: null, reversalOfId: null },
+      });
+      for (const entry of entries) {
+        await this.journalService.voidEntryInTx(tx, entry.id, reason);
+      }
+
+      for (const item of invoice.items) {
+        await tx.salesOrderItem.update({
+          where: { id: item.salesOrderItemId },
+          data: { quantityInvoiced: { decrement: item.quantity } },
+        });
+      }
+
+      return tx.invoice.update({
+        where: { id },
+        data: { cancelledAt: new Date() },
+        include: DETAIL_INCLUDE,
+      });
+    }, { timeout: 15000 });
   }
 
   async recordPayment(invoiceId: number, dto: RecordPaymentDto) {

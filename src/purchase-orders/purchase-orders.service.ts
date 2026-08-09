@@ -2,19 +2,24 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePurchaseOrderDto } from './dto/create-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import { computeTaxAmount } from '../common/tax.util';
 
 @Injectable()
 export class PurchaseOrdersService {
   constructor(private prisma: PrismaService) {}
 
   async create(dto: CreatePurchaseOrderDto) {
-    const totalAmount = dto.items.reduce((sum, i) => sum + i.quantityOrdered * i.unitCost, 0);
+    const subtotal = dto.items.reduce((sum, i) => sum + i.quantityOrdered * i.unitCost, 0);
+    const taxAmount = await computeTaxAmount(this.prisma, dto.taxId, subtotal);
+    const totalAmount = subtotal + taxAmount;
 
     return this.prisma.purchaseOrder.create({
       data: {
         supplierId: dto.supplierId,
         warehouseId: dto.warehouseId,
         reference: dto.reference,
+        taxId: dto.taxId,
+        taxAmount,
         totalAmount,
         items: {
           create: dto.items.map((i) => ({
@@ -73,13 +78,18 @@ export class PurchaseOrdersService {
         });
       }
 
-      const totalAmount = items
-        ? items.reduce((sum, i) => sum + i.quantityOrdered * i.unitCost, 0)
-        : undefined;
+      let totalAmount: number | undefined;
+      let taxAmount: number | undefined;
+      if (items || rest.taxId !== undefined) {
+        const subtotal = items ? items.reduce((sum, i) => sum + i.quantityOrdered * i.unitCost, 0) : po.totalAmount - po.taxAmount;
+        const effectiveTaxId = rest.taxId !== undefined ? rest.taxId : po.taxId;
+        taxAmount = await computeTaxAmount(tx, effectiveTaxId, subtotal);
+        totalAmount = subtotal + taxAmount;
+      }
 
       return tx.purchaseOrder.update({
         where: { id },
-        data: { ...rest, ...(totalAmount !== undefined && { totalAmount }) },
+        data: { ...rest, ...(taxAmount !== undefined && { taxAmount }), ...(totalAmount !== undefined && { totalAmount }) },
         include: { items: { include: { product: true } }, supplier: true, warehouse: true },
       });
     });
