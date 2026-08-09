@@ -260,21 +260,30 @@ export class JournalService {
     return { account, partyType, partyName, lines: rows, endingBalance: runningBalance };
   }
 
-  private async sumForAccount(accountId: number, dateFilter?: { gte?: Date; lte?: Date }) {
+  // warehouseId is optional and, when passed, scopes the sum to lines from that outlet only.
+  // This works cleanly because every posting site that ever sets JournalLine.warehouseId tags
+  // ALL of an entry's lines with the same warehouseId (never just one leg) — so filtering by
+  // warehouseId always selects whole, already-balanced entries, and any aggregate built from
+  // sumForAccount(..., warehouseId) stays internally consistent (debits still equal credits).
+  private async sumForAccount(accountId: number, dateFilter?: { gte?: Date; lte?: Date }, warehouseId?: number) {
     const { _sum } = await this.prisma.journalLine.aggregate({
-      where: { accountId, ...(dateFilter && { journalEntry: { date: dateFilter } }) },
+      where: { accountId, ...(dateFilter && { journalEntry: { date: dateFilter } }), ...(warehouseId && { warehouseId }) },
       _sum: { debit: true, credit: true },
     });
     return { debit: _sum.debit || 0, credit: _sum.credit || 0 };
   }
 
-  async getTrialBalance(asOf?: string) {
+  // Optional warehouseId scopes this to one outlet's activity — see sumForAccount's comment for
+  // why the result still balances. Purchases/Payroll/Manual/Expense postings never carry a
+  // warehouseId, so they simply disappear from a warehouse-filtered trial balance (as expected —
+  // they aren't that outlet's activity), not because anything was dropped in error.
+  async getTrialBalance(asOf?: string, warehouseId?: number) {
     const dateFilter = asOf ? { lte: new Date(asOf + 'T23:59:59.999Z') } : undefined;
     const accounts = await this.prisma.account.findMany({ orderBy: { code: 'asc' } });
 
     const rows = await Promise.all(
       accounts.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, dateFilter);
+        const { debit, credit } = await this.sumForAccount(account.id, dateFilter, warehouseId);
         return { account, totalDebit: debit, totalCredit: credit, balance: debit - credit };
       }),
     );
@@ -287,7 +296,7 @@ export class JournalService {
     };
   }
 
-  async getProfitAndLoss(from?: string, to?: string) {
+  async getProfitAndLoss(from?: string, to?: string, warehouseId?: number) {
     const dateFilter: { gte?: Date; lte?: Date } = {};
     if (from) dateFilter.gte = new Date(from);
     if (to) dateFilter.lte = new Date(to + 'T23:59:59.999Z');
@@ -299,13 +308,13 @@ export class JournalService {
     // Income accounts are credit-normal; expense accounts are debit-normal.
     const incomeLines = await Promise.all(
       incomeAccounts.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, hasFilter ? dateFilter : undefined);
+        const { debit, credit } = await this.sumForAccount(account.id, hasFilter ? dateFilter : undefined, warehouseId);
         return { account, amount: credit - debit };
       }),
     );
     const expenseLines = await Promise.all(
       expenseAccounts.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, hasFilter ? dateFilter : undefined);
+        const { debit, credit } = await this.sumForAccount(account.id, hasFilter ? dateFilter : undefined, warehouseId);
         return { account, amount: debit - credit };
       }),
     );
@@ -374,7 +383,12 @@ export class JournalService {
     };
   }
 
-  async getBalanceSheet(asOf?: string) {
+  // Optional warehouseId scopes this to one outlet's activity. Real Equity accounts (Owner's
+  // Equity etc.) are never touched by warehouse-tagged entries — only Cash/AR/Inventory/Revenue/
+  // COGS/Tax lines from POS/Invoice/Delivery postings are — so a warehouse-filtered balance sheet
+  // still satisfies Assets = Liabilities + Equity: real equity lines come back at 0, and the
+  // synthetic Retained Earnings line (below) carries the warehouse-scoped net income instead.
+  async getBalanceSheet(asOf?: string, warehouseId?: number) {
     const dateFilter = asOf ? { lte: new Date(asOf + 'T23:59:59.999Z') } : undefined;
 
     const assets = await this.prisma.account.findMany({ where: { type: 'ASSET' }, orderBy: { code: 'asc' } });
@@ -383,19 +397,19 @@ export class JournalService {
 
     const assetLines = await Promise.all(
       assets.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, dateFilter);
+        const { debit, credit } = await this.sumForAccount(account.id, dateFilter, warehouseId);
         return { account, amount: debit - credit }; // debit-normal
       }),
     );
     const liabilityLines = await Promise.all(
       liabilities.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, dateFilter);
+        const { debit, credit } = await this.sumForAccount(account.id, dateFilter, warehouseId);
         return { account, amount: credit - debit }; // credit-normal
       }),
     );
     const equityLines: { account: { id: number | null; code: string; name: string }; amount: number }[] = await Promise.all(
       equity.map(async (account) => {
-        const { debit, credit } = await this.sumForAccount(account.id, dateFilter);
+        const { debit, credit } = await this.sumForAccount(account.id, dateFilter, warehouseId);
         return { account, amount: credit - debit }; // credit-normal
       }),
     );
@@ -405,7 +419,7 @@ export class JournalService {
     // Assets = Liabilities + Equity until a period-end close. Instead, fold the
     // current, un-closed net income in as a synthetic "Retained Earnings" line, same
     // as most accounting software does for a live (non-closed) balance sheet.
-    const { netProfit } = await this.getProfitAndLoss(undefined, asOf);
+    const { netProfit } = await this.getProfitAndLoss(undefined, asOf, warehouseId);
     equityLines.push({
       account: { id: null, code: '3900', name: 'Retained Earnings (current, unclosed)' },
       amount: netProfit,

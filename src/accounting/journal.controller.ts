@@ -65,18 +65,18 @@ export class JournalController {
   }
 
   @Get('trial-balance')
-  getTrialBalance(@Query('asOf') asOf?: string) {
-    return this.journalService.getTrialBalance(asOf);
+  getTrialBalance(@Query('asOf') asOf?: string, @Query('warehouseId') warehouseId?: string) {
+    return this.journalService.getTrialBalance(asOf, warehouseId ? Number(warehouseId) : undefined);
   }
 
   @Get('reports/profit-loss')
-  getProfitAndLoss(@Query('from') from?: string, @Query('to') to?: string) {
-    return this.journalService.getProfitAndLoss(from, to);
+  getProfitAndLoss(@Query('from') from?: string, @Query('to') to?: string, @Query('warehouseId') warehouseId?: string) {
+    return this.journalService.getProfitAndLoss(from, to, warehouseId ? Number(warehouseId) : undefined);
   }
 
   @Get('reports/balance-sheet')
-  getBalanceSheet(@Query('asOf') asOf?: string) {
-    return this.journalService.getBalanceSheet(asOf);
+  getBalanceSheet(@Query('asOf') asOf?: string, @Query('warehouseId') warehouseId?: string) {
+    return this.journalService.getBalanceSheet(asOf, warehouseId ? Number(warehouseId) : undefined);
   }
 
   @Get('reports/outlet-pnl')
