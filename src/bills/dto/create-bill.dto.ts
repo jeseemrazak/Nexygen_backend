@@ -26,6 +26,10 @@ export class CreateBillDto {
 
   @IsInt()
   @IsOptional()
+  costCenterId?: number;
+
+  @IsInt()
+  @IsOptional()
   paymentTermId?: number;
 
   @IsInt()

@@ -20,6 +20,7 @@ export class PurchaseOrdersService {
         reference: dto.reference,
         taxId: dto.taxId,
         taxAmount,
+        costCenterId: dto.costCenterId,
         totalAmount,
         items: {
           create: dto.items.map((i) => ({

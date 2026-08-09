@@ -149,21 +149,21 @@ enum EmployeeLoanStatus {
 
 // --- CORE TABLES ---
 model User {
-  id                    Int            @id @default(autoincrement())
-  email                 String         @unique
+  id                    Int           @id @default(autoincrement())
+  email                 String        @unique
   password              String
   name                  String?
-  role                  Role           @default(MERCHANDISER)
+  role                  Role          @default(MERCHANDISER)
   salesOrders           SalesOrder[] // A merchandiser can be assigned many sales orders
   quotations            Quotation[]
   employee              Employee?
   jobOrdersAsTechnician JobOrder[]
   leadsAssigned         Lead[]
   appointmentsAsStaff   Appointment[]
-  tasksAssigned         Task[]         @relation("TaskAssignee")
-  tasksCreated          Task[]         @relation("TaskCreator")
-  createdAt             DateTime       @default(now())
-  updatedAt             DateTime       @updatedAt
+  tasksAssigned         Task[]        @relation("TaskAssignee")
+  tasksCreated          Task[]        @relation("TaskCreator")
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
 }
 
 model Warehouse {
@@ -210,6 +210,10 @@ model Product {
   posCategory        PosCategory?        @relation(fields: [posCategoryId], references: [id], onDelete: SetNull)
   unitId             Int?
   unit               UnitOfMeasurement?  @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  // Default tax suggested (not forced) onto a Sales/Purchase document's single document-level
+  // tax when this product is the first line item added to a new, still-untaxed document.
+  taxId              Int?
+  tax                Tax?                @relation(fields: [taxId], references: [id], onDelete: SetNull)
   inventories        Inventory[]
   salesOrderItems    SalesOrderItem[]
   deliveryItems      DeliveryItem[]
@@ -276,8 +280,13 @@ model SalesOrder {
   // Applied to (subtotal - discount), added on top — never baked into line prices like a
   // discount is, since tax is shown as its own line on every document/receipt.
   taxId     Int?
-  tax       Tax?    @relation(fields: [taxId], references: [id])
-  taxAmount Float   @default(0)
+  tax       Tax?  @relation(fields: [taxId], references: [id])
+  taxAmount Float @default(0)
+
+  // Department/project reporting dimension, carried onto the eventual Invoice's GL posting
+  // (see Invoice.costCenterId) — purely a reporting tag, no effect on totals.
+  costCenterId Int?
+  costCenter   CostCenter? @relation(fields: [costCenterId], references: [id])
 
   termsAndConditions String?
   // Customer's own PO/reference number for this order — free text.
@@ -404,6 +413,11 @@ model Invoice {
   taxId         Int?
   tax           Tax?          @relation(fields: [taxId], references: [id])
   taxAmount     Float         @default(0)
+  // Reporting dimension, tagged onto this invoice's SALES_REVENUE journal line at posting time —
+  // independently selectable from the SalesOrder's own costCenterId, same "re-selected, not
+  // silently copied" relationship the two documents already have for taxId.
+  costCenterId  Int?
+  costCenter    CostCenter?   @relation(fields: [costCenterId], references: [id])
   totalAmount   Float
   paymentStatus PaymentStatus @default(UNPAID)
   amountPaid    Float         @default(0)
@@ -712,13 +726,15 @@ model LoyaltyTransaction {
 // (GL posts here) — a PurchaseOrder can have several Bills (partial billing), independent of
 // receipt progress (billing policy = against ordered quantity, matching the Sales side's Invoice).
 model PurchaseOrder {
-  id          Int                 @id @default(autoincrement())
-  status      PurchaseOrderStatus @default(DRAFT)
-  totalAmount Float               @default(0)
-  taxId       Int?
-  tax         Tax?                @relation(fields: [taxId], references: [id])
-  taxAmount   Float               @default(0)
-  reference   String? // Supplier's own invoice/PO number
+  id           Int                 @id @default(autoincrement())
+  status       PurchaseOrderStatus @default(DRAFT)
+  totalAmount  Float               @default(0)
+  taxId        Int?
+  tax          Tax?                @relation(fields: [taxId], references: [id])
+  taxAmount    Float               @default(0)
+  costCenterId Int?
+  costCenter   CostCenter?         @relation(fields: [costCenterId], references: [id])
+  reference    String? // Supplier's own invoice/PO number
 
   supplierId Int
   supplier   Supplier @relation(fields: [supplierId], references: [id])
@@ -820,6 +836,11 @@ model Bill {
   taxId         Int?
   tax           Tax?              @relation(fields: [taxId], references: [id])
   taxAmount     Float             @default(0)
+  // Reporting dimension, tagged onto this bill's STOCK_INTERIM journal line at posting time —
+  // independently selectable from the PurchaseOrder's own costCenterId (same relationship taxId
+  // already has between PurchaseOrder and Bill).
+  costCenterId  Int?
+  costCenter    CostCenter?       @relation(fields: [costCenterId], references: [id])
   totalAmount   Float
   paymentStatus PaymentStatus     @default(UNPAID)
   amountPaid    Float             @default(0)
@@ -889,8 +910,8 @@ model Quotation {
   discountValue Float   @default(0)
 
   taxId     Int?
-  tax       Tax?    @relation(fields: [taxId], references: [id])
-  taxAmount Float   @default(0)
+  tax       Tax?  @relation(fields: [taxId], references: [id])
+  taxAmount Float @default(0)
 
   termsAndConditions String?
   // Customer's own PO/reference number for this quotation — free text.
@@ -1052,6 +1073,7 @@ model Tax {
   purchaseOrders PurchaseOrder[]
   bills          Bill[]
   posSales       PosSale[]
+  products       Product[]
 }
 
 // Foreign currencies quotable on an Invoice/Bill on top of the base (QAR) figures — every dollar
@@ -1108,14 +1130,14 @@ model Journal {
 // CASH_BANK posts through the linked journal's default account; ACCOUNT_RECEIVABLE posts to AR
 // (no journal needed — it's billed on credit).
 model PaymentMethod {
-  id        Int               @id @default(autoincrement())
-  name      String            @unique
-  type      PaymentMethodType @default(CASH_BANK)
-  journalId Int?
-  journal   Journal?          @relation(fields: [journalId], references: [id])
-  isActive  Boolean           @default(true)
-  sortOrder Int               @default(0)
-  posSales  PosSale[]
+  id              Int               @id @default(autoincrement())
+  name            String            @unique
+  type            PaymentMethodType @default(CASH_BANK)
+  journalId       Int?
+  journal         Journal?          @relation(fields: [journalId], references: [id])
+  isActive        Boolean           @default(true)
+  sortOrder       Int               @default(0)
+  posSales        PosSale[]
   posSalePayments PosSalePayment[]
 }
 
@@ -1193,12 +1215,12 @@ model UnitOfMeasurement {
 // A customer's/supplier's default credit terms (e.g. "Net 30") — resolved onto Invoice/Bill at
 // creation time to compute a real dueDate, instead of AR/AP aging just counting from createdAt.
 model PaymentTerm {
-  id        Int       @id @default(autoincrement())
+  id        Int      @id @default(autoincrement())
   name      String // e.g. "Net 30", "Due on Receipt"
   days      Int // 0 = due immediately
-  isActive  Boolean   @default(true)
-  isDefault Boolean   @default(false)
-  createdAt DateTime  @default(now())
+  isActive  Boolean  @default(true)
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
 
   customers Customer[]
   suppliers Supplier[]
@@ -1215,8 +1237,12 @@ model CostCenter {
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
-  journalLines JournalLine[]
-  expenses     Expense[]
+  journalLines   JournalLine[]
+  expenses       Expense[]
+  salesOrders    SalesOrder[]
+  invoices       Invoice[]
+  purchaseOrders PurchaseOrder[]
+  bills          Bill[]
 }
 
 // A named accounting period (e.g. "FY2026") that can be LOCKED to freeze the ledger — once
@@ -1386,7 +1412,7 @@ model PosSale {
   servedById Int?
   servedBy   PosStaff? @relation(fields: [servedById], references: [id])
 
-  items PosSaleItem[]
+  items    PosSaleItem[]
   payments PosSalePayment[]
 
   // Set when this sale is cancelled — restocks inventory and reverses the GL postings at the
@@ -1639,4 +1665,3 @@ model EosAccrualLog {
   journalEntryId Int?
   createdAt      DateTime @default(now())
 }
-

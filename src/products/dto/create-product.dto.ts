@@ -56,4 +56,10 @@ export class CreateProductDto {
   @IsInt()
   @IsOptional()
   unitId?: number;
+
+  // Default tax suggested onto a Sales/Purchase document when this product is the first line
+  // item added — see the schema comment on Product.taxId for the exact behavior.
+  @IsInt()
+  @IsOptional()
+  taxId?: number;
 }

@@ -77,7 +77,7 @@ export class InvoicesService {
       }
 
       const invoice = await tx.invoice.create({
-        data: { salesOrderId: dto.salesOrderId, subtotal, taxId: dto.taxId, taxAmount, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
+        data: { salesOrderId: dto.salesOrderId, subtotal, taxId: dto.taxId, taxAmount, costCenterId: dto.costCenterId, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
       });
       await tx.invoice.update({
         where: { id: invoice.id },
@@ -113,9 +113,9 @@ export class InvoicesService {
           this.journalService.getMappedAccountId(tx, AccountMappingRole.SALES_REVENUE),
           taxAmount > 0 ? this.journalService.getMappedAccountId(tx, AccountMappingRole.TAX_PAYABLE) : Promise.resolve(null),
         ]);
-        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'CUSTOMER'; partyName?: string; warehouseId?: number }[] = [
+        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'CUSTOMER'; partyName?: string; warehouseId?: number; costCenterId?: number }[] = [
           { accountId: arAccountId, debit: totalAmount, partyType: 'CUSTOMER', partyName: order.clientName || 'Walk-in', warehouseId: order.warehouseId },
-          { accountId: revenueAccountId, credit: subtotal, warehouseId: order.warehouseId },
+          { accountId: revenueAccountId, credit: subtotal, warehouseId: order.warehouseId, costCenterId: dto.costCenterId },
         ];
         if (taxAmount > 0) lines.push({ accountId: taxPayableAccountId!, credit: taxAmount, warehouseId: order.warehouseId });
         await this.journalService.postEntry(tx, {

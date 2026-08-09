@@ -74,7 +74,7 @@ export class BillsService {
       }
 
       const bill = await tx.bill.create({
-        data: { purchaseOrderId: dto.purchaseOrderId, subtotal, taxId: dto.taxId, taxAmount, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
+        data: { purchaseOrderId: dto.purchaseOrderId, subtotal, taxId: dto.taxId, taxAmount, costCenterId: dto.costCenterId, totalAmount, paymentTermId: effectiveTermId, dueDate, ...currencyFields },
       });
       await tx.bill.update({
         where: { id: bill.id },
@@ -113,8 +113,8 @@ export class BillsService {
           this.journalService.getMappedAccountId(tx, AccountMappingRole.ACCOUNTS_PAYABLE),
           taxAmount > 0 ? this.journalService.getMappedAccountId(tx, AccountMappingRole.TAX_RECEIVABLE) : Promise.resolve(null),
         ]);
-        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'SUPPLIER'; partyName?: string }[] = [
-          { accountId: stockInterimAccountId, debit: subtotal },
+        const lines: { accountId: number; debit?: number; credit?: number; partyType?: 'SUPPLIER'; partyName?: string; costCenterId?: number }[] = [
+          { accountId: stockInterimAccountId, debit: subtotal, costCenterId: dto.costCenterId },
         ];
         if (taxAmount > 0) lines.push({ accountId: taxReceivableAccountId!, debit: taxAmount });
         lines.push({ accountId: apAccountId, credit: totalAmount, partyType: 'SUPPLIER', partyName: po.supplier.name });

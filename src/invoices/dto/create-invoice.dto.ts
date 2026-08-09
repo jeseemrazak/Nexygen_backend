@@ -20,6 +20,10 @@ export class CreateInvoiceDto {
 
   @IsInt()
   @IsOptional()
+  costCenterId?: number;
+
+  @IsInt()
+  @IsOptional()
   paymentTermId?: number;
 
   @IsInt()

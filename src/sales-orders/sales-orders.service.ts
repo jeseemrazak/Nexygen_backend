@@ -55,6 +55,7 @@ export class SalesOrdersService {
         discountValue: dto.discountValue ?? 0,
         taxId: dto.taxId,
         taxAmount,
+        costCenterId: dto.costCenterId,
         subtotal,
         totalAmount,
         items: {
