@@ -55,6 +55,7 @@ export class PurchaseOrdersService {
         items: { include: { product: true } },
         receipts: { include: { items: { include: { product: true } } }, orderBy: { createdAt: 'desc' } },
         bills: { include: { items: true }, orderBy: { createdAt: 'desc' } },
+        tax: true,
       },
     });
   }

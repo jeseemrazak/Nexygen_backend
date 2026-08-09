@@ -82,6 +82,7 @@ export class QuotationsService {
         warehouse: true,
         customer: true,
         convertedOrder: true,
+        tax: true,
       },
     });
   }

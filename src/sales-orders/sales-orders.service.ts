@@ -13,6 +13,7 @@ const DETAIL_INCLUDE = {
   customer: true,
   deliveries: { include: { items: { include: { product: true } } }, orderBy: { createdAt: 'desc' as const } },
   invoices: { orderBy: { createdAt: 'desc' as const } },
+  tax: true,
 };
 
 @Injectable()

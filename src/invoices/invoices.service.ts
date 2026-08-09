@@ -10,6 +10,7 @@ const DETAIL_INCLUDE = {
   payments: { orderBy: { receivedAt: 'desc' as const } },
   salesOrder: { include: { warehouse: true, user: { select: { name: true, email: true } } } },
   currency: true,
+  tax: true,
 };
 
 @Injectable()
